@@ -1,0 +1,3 @@
+[submodule "components/usbipdcpp/usbipdcpp"]
+	path = components/usbipdcpp/usbipdcpp
+	url = https://github.com/yunsmall/usbipdcpp

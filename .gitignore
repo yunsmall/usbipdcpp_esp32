@@ -1,0 +1,6 @@
+cmake-build*
+[Bb]uild
+managed_components
+.idea
+dependencies.lock
+sdkconfig.old
