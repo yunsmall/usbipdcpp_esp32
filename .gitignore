@@ -2,5 +2,6 @@ cmake-build*
 [Bb]uild
 managed_components
 .idea
+.vscode
 dependencies.lock
 sdkconfig.old

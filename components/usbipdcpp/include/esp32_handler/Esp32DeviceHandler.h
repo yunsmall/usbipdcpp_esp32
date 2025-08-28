@@ -8,7 +8,6 @@
 
 #include "DeviceHandler/DeviceHandler.h"
 #include "SetupPacket.h"
-#include "constant.h"
 #include "esp32_handler/tools.h"
 
 namespace usbipdcpp
@@ -48,6 +47,12 @@ namespace usbipdcpp
                                          const data_type& req,
                                          const std::vector<UsbIpIsoPacketDescriptor>& iso_packet_descriptors,
                                          std::error_code& ec) override;
+        void cancel_all_transfer();
+        void cancel_endpoint_all_transfers(uint8_t bEndpointAddress);
+
+        //防止还没结束恢复端点状态就重新提交导致状态错误
+        std::shared_mutex endpoint_cancellation_mutex;
+
         /**
          * @brief 发生错误代表没成功传输，设备未收到消息
          * @param setup_packet

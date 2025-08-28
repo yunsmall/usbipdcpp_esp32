@@ -22,72 +22,18 @@ usbipdcpp::Esp32DeviceHandler::~Esp32DeviceHandler() {
 void usbipdcpp::Esp32DeviceHandler::on_new_connection(error_code &ec) {
 }
 
-void cancel_endpoint_all_transfers(usb_device_handle_t dev_hdl, uint8_t bEndpointAddress) {
-    esp_err_t err;
-    err = usb_host_endpoint_halt(dev_hdl, bEndpointAddress);
-    if (err != ESP_OK) {
-        SPDLOG_ERROR("usb_host_endpoint_halt address {} failed: {}", bEndpointAddress, esp_err_to_name(err));
-    }
-    err = usb_host_endpoint_flush(dev_hdl, bEndpointAddress);
-    if (err != ESP_OK) {
-        SPDLOG_ERROR("usb_host_endpoint_flush address {} failed: {}", bEndpointAddress, esp_err_to_name(err));
-    }
-    err = usb_host_endpoint_clear(dev_hdl, bEndpointAddress);
-    if (err != ESP_OK) {
-        SPDLOG_ERROR("usb_host_endpoint_clear address {} failed: {}", bEndpointAddress, esp_err_to_name(err));
-    }
-}
-
 void usbipdcpp::Esp32DeviceHandler::on_disconnection(error_code &ec) {
     all_transfer_should_stop = true;
     if (!has_device) {
         SPDLOG_WARN("没有设备，不需要停止传输");
         return;
     }
-
-    // 0号端口不支持
-    // cancel_endpoint_all_transfers(native_handle, 0x00);
-    // cancel_endpoint_all_transfers(native_handle, 0x80);
-
-    const usb_config_desc_t *config_desc;
-    ESP_ERROR_CHECK(usb_host_get_active_config_descriptor(native_handle, &config_desc));
-    const usb_intf_desc_t *intf = NULL;
-    for (int i = 0; i < config_desc->bNumInterfaces; i++) {
-        int intf_offset;
-        intf = usb_parse_interface_descriptor(config_desc, i, 0, &intf_offset);
-        if (!intf)
-            continue;
-
-        for (int j = 0; j < intf->bNumEndpoints; j++) {
-            int endpoint_offset = intf_offset;
-            const usb_ep_desc_t *ep = usb_parse_endpoint_descriptor_by_index(
-                    intf, j, config_desc->wTotalLength, &endpoint_offset);
-            if (!ep)
-                continue;
-            // 清除当前端点的所有传输
-            cancel_endpoint_all_transfers(native_handle, ep->bEndpointAddress);
-        }
-    }
+    cancel_all_transfer();
     spdlog::info("成功取消所有传输");
 }
 
 void usbipdcpp::Esp32DeviceHandler::handle_unlink_seqnum(std::uint32_t seqnum) {
-    // int err = 0;
-    // {
-    //     std::lock_guard lock(transferring_data_mutex);
-    //     if (transferring_data.contains(seqnum)) {
-    //         usb_host_endpoint_halt()
-    //         usb_host_endpoint_flush()
-    //         usb_host_endpoint_clear()
-    //
-    //         err = libusb_cancel_transfer(transferring_data.at(seqnum));
-    //     }
-    // }
-    // if (err) {
-    //     SPDLOG_ERROR("libusb_cancel_transfer failed: {}", libusb_strerror(err));
-    // }
-    //esp32 cancel某个transfer没有专门api，实现太繁琐，因此未实现
-    SPDLOG_WARN("未实现的esp32 handle_unlink_seqnum");
+    cancel_all_transfer();
 }
 
 void usbipdcpp::Esp32DeviceHandler::handle_control_urb(Session &session,
@@ -378,6 +324,50 @@ error_occurred:
             UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum));
 }
 
+void usbipdcpp::Esp32DeviceHandler::cancel_all_transfer() {
+
+    // 0号端口不支持
+    // cancel_endpoint_all_transfers(native_handle, 0x00);
+    // cancel_endpoint_all_transfers(native_handle, 0x80);
+
+    const usb_config_desc_t *config_desc;
+    ESP_ERROR_CHECK(usb_host_get_active_config_descriptor(native_handle, &config_desc));
+    const usb_intf_desc_t *intf = NULL;
+    for (int i = 0; i < config_desc->bNumInterfaces; i++) {
+        int intf_offset;
+        intf = usb_parse_interface_descriptor(config_desc, i, 0, &intf_offset);
+        if (!intf)
+            continue;
+
+        for (int j = 0; j < intf->bNumEndpoints; j++) {
+            int endpoint_offset = intf_offset;
+            const usb_ep_desc_t *ep = usb_parse_endpoint_descriptor_by_index(
+                    intf, j, config_desc->wTotalLength, &endpoint_offset);
+            if (!ep)
+                continue;
+            // 清除当前端点的所有传输
+            cancel_endpoint_all_transfers(ep->bEndpointAddress);
+        }
+    }
+}
+
+void usbipdcpp::Esp32DeviceHandler::cancel_endpoint_all_transfers(uint8_t bEndpointAddress) {
+    std::lock_guard lock(endpoint_cancellation_mutex);
+    esp_err_t err;
+    err = usb_host_endpoint_halt(native_handle, bEndpointAddress);
+    if (err != ESP_OK) {
+        SPDLOG_ERROR("usb_host_endpoint_halt address {} failed: {}", bEndpointAddress, esp_err_to_name(err));
+    }
+    err = usb_host_endpoint_flush(native_handle, bEndpointAddress);
+    if (err != ESP_OK) {
+        SPDLOG_ERROR("usb_host_endpoint_flush address {} failed: {}", bEndpointAddress, esp_err_to_name(err));
+    }
+    err = usb_host_endpoint_clear(native_handle, bEndpointAddress);
+    if (err != ESP_OK) {
+        SPDLOG_ERROR("usb_host_endpoint_clear address {} failed: {}", bEndpointAddress, esp_err_to_name(err));
+    }
+}
+
 esp_err_t usbipdcpp::Esp32DeviceHandler::sync_control_transfer(const SetupPacket &setup_packet) const {
     usb_transfer_t *transfer = nullptr;
     auto err = usb_host_transfer_alloc(USB_SETUP_PACKET_SIZE, 0, &transfer);
@@ -551,15 +541,14 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
         std::lock_guard lock(callback_arg.handler.transferring_data_mutex);
         callback_arg.handler.transferring_data.erase(callback_arg.seqnum);
     }
-
-    std::optional<std::uint32_t> cmd_unlink_seqnum = std::nullopt;
+    auto unlink_found = callback_arg.session.get_unlink_seqnum(callback_arg.seqnum);
     // std::error_code ec;
     switch (trx->status) {
         case USB_TRANSFER_STATUS_COMPLETED:
             /* OK */
             break;
         case USB_TRANSFER_STATUS_ERROR:
-            // if (!(trx->flags & LIBUSB_TRANSFER_SHORT_NOT_OK)) {
+            // if (!(trx->flags & USB_SHO)) {
             //     dev_err(libusb_get_device(trx->dev_handle),
             //             "error on endpoint {}", trx->endpoint);
             // }
@@ -569,17 +558,12 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
             // }
             break;
         case USB_TRANSFER_STATUS_CANCELED: {
-            if (!callback_arg.handler.all_transfer_should_stop) {
-                //代表当前只是取消了单个transfer，先判断自己是不是这个transfer
-                auto unlink_found = callback_arg.session.get_unlink_seqnum(callback_arg.seqnum);
-                if (std::get<0>(unlink_found)) {
-                    //取消的是自己，则标明存在cmd_unlink的seqnum，供后面读取
-                    cmd_unlink_seqnum = std::get<1>(unlink_found);
-                }
-                else {
-                    //取消的不是自己，重新提交自己
-                    trx->status = USB_TRANSFER_STATUS_COMPLETED;
-                    esp_err_t err;
+            if (!std::get<0>(unlink_found)) {
+                //取消的不是自己，重新提交自己
+                trx->status = USB_TRANSFER_STATUS_COMPLETED;
+                esp_err_t err;
+                {
+                    std::shared_lock lock(callback_arg.handler.endpoint_cancellation_mutex);
                     if (callback_arg.transfer_type == USB_TRANSFER_TYPE_CTRL) {
                         SPDLOG_TRACE("尝试重新提交控制传输");
                         err = usb_host_transfer_submit_control(callback_arg.handler.host_client_handle, trx);
@@ -588,15 +572,15 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
                         SPDLOG_TRACE("尝试重新提交非控制传输");
                         err = usb_host_transfer_submit(trx);
                     }
-                    if (err != ESP_OK) {
-                        SPDLOG_ERROR("seqnum为{}的传输重新提交失败：{}", callback_arg.seqnum, esp_err_to_name(err));
-                        //提交epipe
-                        callback_arg.session.submit_ret_submit(
-                                UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(
-                                        callback_arg.seqnum));
-                    }
-                    return;
                 }
+                if (err != ESP_OK) {
+                    SPDLOG_ERROR("seqnum为{}的传输重新提交失败：{}", callback_arg.seqnum, esp_err_to_name(err));
+                    //提交epipe
+                    callback_arg.session.submit_ret_submit(
+                            UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(
+                                    callback_arg.seqnum));
+                }
+                return;
             }
         }
         break;
@@ -623,7 +607,8 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
     SPDLOG_DEBUG("libusb传输了{}个字节", trx->actual_num_bytes);
 
     std::vector<UsbIpIsoPacketDescriptor> iso_packet_descriptors{};
-    if (!cmd_unlink_seqnum.has_value()) {
+
+    if (!std::get<0>(unlink_found)) {
         //发送ret_submit
         data_type received_data;
         if (!callback_arg.is_out) {
@@ -679,10 +664,12 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
                 );
     }
     else {
+        auto cmd_unlink_seqnum = std::get<1>(unlink_found);
+
         //发送ret_unlink
         callback_arg.session.submit_ret_unlink_and_then_remove_seqnum_unlink(
                 UsbIpResponse::UsbIpRetUnlink::create_ret_unlink(
-                        *cmd_unlink_seqnum,
+                        cmd_unlink_seqnum,
                         trxstat2error(trx->status)
                         ),
                 callback_arg.seqnum
