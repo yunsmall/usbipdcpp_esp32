@@ -22,25 +22,24 @@ namespace usbipdcpp
 
         ~Esp32DeviceHandler() override;
 
-        void on_new_connection(error_code& ec) override;
+        void on_new_connection(Session& current_session, error_code& ec) override;
         void on_disconnection(error_code& ec) override;
         void handle_unlink_seqnum(std::uint32_t seqnum) override;
 
     protected:
-        void handle_control_urb(Session& session,
-                                std::uint32_t seqnum, const UsbEndpoint& ep,
+        void handle_control_urb(std::uint32_t seqnum, const UsbEndpoint& ep,
                                 std::uint32_t transfer_flags, std::uint32_t transfer_buffer_length,
                                 const SetupPacket& setup_packet, const data_type& req, std::error_code& ec) override;
-        void handle_bulk_transfer(Session& session, std::uint32_t seqnum, const UsbEndpoint& ep,
+        void handle_bulk_transfer(std::uint32_t seqnum, const UsbEndpoint& ep,
                                   UsbInterface& interface, std::uint32_t transfer_flags,
                                   std::uint32_t transfer_buffer_length, const data_type& out_data,
                                   std::error_code& ec) override;
-        void handle_interrupt_transfer(Session& session, std::uint32_t seqnum, const UsbEndpoint& ep,
+        void handle_interrupt_transfer(std::uint32_t seqnum, const UsbEndpoint& ep,
                                        UsbInterface& interface, std::uint32_t transfer_flags,
                                        std::uint32_t transfer_buffer_length, const data_type& out_data,
                                        std::error_code& ec) override;
 
-        void handle_isochronous_transfer(Session& session, std::uint32_t seqnum,
+        void handle_isochronous_transfer(std::uint32_t seqnum,
                                          const UsbEndpoint& ep, UsbInterface& interface,
                                          std::uint32_t transfer_flags,
                                          std::uint32_t transfer_buffer_length,
@@ -80,7 +79,6 @@ namespace usbipdcpp
         struct esp32_callback_args
         {
             Esp32DeviceHandler& handler;
-            Session& session;
             std::uint32_t seqnum;
             usb_transfer_type_t transfer_type;
             bool is_out;

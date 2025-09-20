@@ -25,6 +25,7 @@ namespace usbipdcpp
         ~Esp32Server() override;
 
     protected:
+        void on_session_exit() override;
         void if_is_esp32_then_mark_removed(std::shared_ptr<AbstDeviceHandler> handler);
         void remove_gone_device(usb_device_handle_t dev);
 

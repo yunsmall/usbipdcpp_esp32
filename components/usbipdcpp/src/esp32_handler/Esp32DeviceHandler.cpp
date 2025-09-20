@@ -19,30 +19,39 @@ usbipdcpp::Esp32DeviceHandler::Esp32DeviceHandler(UsbDevice &handle_device, usb_
 usbipdcpp::Esp32DeviceHandler::~Esp32DeviceHandler() {
 }
 
-void usbipdcpp::Esp32DeviceHandler::on_new_connection(error_code &ec) {
+void usbipdcpp::Esp32DeviceHandler::on_new_connection(Session &current_session, error_code &ec) {
+    session = &current_session;
+    all_transfer_should_stop = false;
 }
 
 void usbipdcpp::Esp32DeviceHandler::on_disconnection(error_code &ec) {
     all_transfer_should_stop = true;
     if (!has_device) {
         SPDLOG_WARN("没有设备，不需要停止传输");
+        session = nullptr;
         return;
     }
     cancel_all_transfer();
     spdlog::info("成功取消所有传输");
+    transferring_data.clear();
+    session = nullptr;
 }
 
 void usbipdcpp::Esp32DeviceHandler::handle_unlink_seqnum(std::uint32_t seqnum) {
+    if (!has_device) {
+        //设备已经没了不可以再取消传输
+        return;
+    }
     cancel_all_transfer();
 }
 
-void usbipdcpp::Esp32DeviceHandler::handle_control_urb(Session &session,
-                                                       std::uint32_t seqnum,
-                                                       const UsbEndpoint &ep,
-                                                       std::uint32_t transfer_flags,
-                                                       std::uint32_t transfer_buffer_length,
-                                                       const SetupPacket &setup_packet, const data_type &req,
-                                                       [[maybe_unused]] std::error_code &ec) {
+void usbipdcpp::Esp32DeviceHandler::handle_control_urb(
+        std::uint32_t seqnum,
+        const UsbEndpoint &ep,
+        std::uint32_t transfer_flags,
+        std::uint32_t transfer_buffer_length,
+        const SetupPacket &setup_packet, const data_type &req,
+        [[maybe_unused]] std::error_code &ec) {
     if (!has_device) {
         ec = make_error_code(ErrorType::NO_DEVICE);
         return;
@@ -66,7 +75,6 @@ void usbipdcpp::Esp32DeviceHandler::handle_control_urb(Session &session,
             }
             auto *callback_args = new esp32_callback_args{
                     .handler = *this,
-                    .session = session,
                     .seqnum = seqnum,
                     .transfer_type = USB_TRANSFER_TYPE_CTRL,
                     .is_out = setup_packet.is_out()
@@ -103,7 +111,7 @@ void usbipdcpp::Esp32DeviceHandler::handle_control_urb(Session &session,
         return;
     error_occurred:
         SPDLOG_ERROR("控制传输失败:{}", esp_err_to_name(err));
-        session.submit_ret_submit(
+        session->submit_ret_submit(
                 UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum));
         return;
     }
@@ -111,7 +119,7 @@ void usbipdcpp::Esp32DeviceHandler::handle_control_urb(Session &session,
         SPDLOG_INFO("拦截了控制包：{}", seqnum);
         //SPDLOG_INFO("拦截了包: {}", setup_packet.to_string());
         //返回空包
-        session.submit_ret_submit(UsbIpResponse::UsbIpRetSubmit::create_ret_submit(
+        session->submit_ret_submit(UsbIpResponse::UsbIpRetSubmit::create_ret_submit(
                 seqnum,
                 static_cast<std::uint32_t>(UrbStatusType::StatusOK),
                 0,
@@ -123,7 +131,7 @@ void usbipdcpp::Esp32DeviceHandler::handle_control_urb(Session &session,
     }
 }
 
-void usbipdcpp::Esp32DeviceHandler::handle_bulk_transfer(Session &session, std::uint32_t seqnum, const UsbEndpoint &ep,
+void usbipdcpp::Esp32DeviceHandler::handle_bulk_transfer(std::uint32_t seqnum, const UsbEndpoint &ep,
                                                          UsbInterface &interface,
                                                          std::uint32_t transfer_flags,
                                                          std::uint32_t transfer_buffer_length,
@@ -150,7 +158,6 @@ void usbipdcpp::Esp32DeviceHandler::handle_bulk_transfer(Session &session, std::
         }
         auto *callback_args = new esp32_callback_args{
                 .handler = *this,
-                .session = session,
                 .seqnum = seqnum,
                 .transfer_type = USB_TRANSFER_TYPE_BULK,
                 .is_out = is_out
@@ -160,7 +167,6 @@ void usbipdcpp::Esp32DeviceHandler::handle_bulk_transfer(Session &session, std::
         transfer->context = callback_args;
         transfer->bEndpointAddress = ep.address;
         transfer->num_bytes = transfer_buffer_length;
-
         transfer->flags = get_esp32_transfer_flags(transfer_flags);
         if (is_out) {
             transfer->flags &= USB_TRANSFER_FLAG_ZERO_PACK;
@@ -183,11 +189,11 @@ void usbipdcpp::Esp32DeviceHandler::handle_bulk_transfer(Session &session, std::
     return;
 error_occurred:
     SPDLOG_ERROR("块传输失败，{}", esp_err_to_name(err));
-    session.submit_ret_submit(
+    session->submit_ret_submit(
             UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum));
 }
 
-void usbipdcpp::Esp32DeviceHandler::handle_interrupt_transfer(Session &session, std::uint32_t seqnum,
+void usbipdcpp::Esp32DeviceHandler::handle_interrupt_transfer(std::uint32_t seqnum,
                                                               const UsbEndpoint &ep,
                                                               UsbInterface &interface,
                                                               std::uint32_t transfer_flags,
@@ -214,7 +220,6 @@ void usbipdcpp::Esp32DeviceHandler::handle_interrupt_transfer(Session &session, 
         }
         auto *callback_args = new esp32_callback_args{
                 .handler = *this,
-                .session = session,
                 .seqnum = seqnum,
                 .transfer_type = USB_TRANSFER_TYPE_INTR,
                 .is_out = is_out
@@ -224,7 +229,6 @@ void usbipdcpp::Esp32DeviceHandler::handle_interrupt_transfer(Session &session, 
         transfer->context = callback_args;
         transfer->bEndpointAddress = ep.address;
         transfer->num_bytes = transfer_buffer_length;
-
         transfer->flags = get_esp32_transfer_flags(transfer_flags);
 
         {
@@ -246,20 +250,20 @@ error_occurred:
     SPDLOG_ERROR("中断传输失败，{}", esp_err_to_name(err));
     //不认为是错误，让服务器重置
     // ec = make_error_code(ErrorType::TRANSFER_ERROR);
-    session.submit_ret_submit(
+    session->submit_ret_submit(
             UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum));
 }
 
-void usbipdcpp::Esp32DeviceHandler::handle_isochronous_transfer(Session &session,
-                                                                std::uint32_t seqnum,
-                                                                const UsbEndpoint &ep,
-                                                                UsbInterface &interface,
-                                                                std::uint32_t transfer_flags,
-                                                                std::uint32_t transfer_buffer_length,
-                                                                const data_type &req,
-                                                                const std::vector<UsbIpIsoPacketDescriptor> &
-                                                                iso_packet_descriptors,
-                                                                [[maybe_unused]] std::error_code &ec) {
+void usbipdcpp::Esp32DeviceHandler::handle_isochronous_transfer(
+        std::uint32_t seqnum,
+        const UsbEndpoint &ep,
+        UsbInterface &interface,
+        std::uint32_t transfer_flags,
+        std::uint32_t transfer_buffer_length,
+        const data_type &req,
+        const std::vector<UsbIpIsoPacketDescriptor> &
+        iso_packet_descriptors,
+        [[maybe_unused]] std::error_code &ec) {
     if (!has_device) {
         ec = make_error_code(ErrorType::NO_DEVICE);
         return;
@@ -281,7 +285,6 @@ void usbipdcpp::Esp32DeviceHandler::handle_isochronous_transfer(Session &session
         }
         auto *callback_args = new esp32_callback_args{
                 .handler = *this,
-                .session = session,
                 .seqnum = seqnum,
                 .transfer_type = USB_TRANSFER_TYPE_ISOCHRONOUS,
                 .is_out = is_out
@@ -320,7 +323,7 @@ void usbipdcpp::Esp32DeviceHandler::handle_isochronous_transfer(Session &session
     return;
 error_occurred:
     SPDLOG_ERROR("同步传输失败，{}", esp_err_to_name(err));
-    session.submit_ret_submit(
+    session->submit_ret_submit(
             UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum));
 }
 
@@ -536,12 +539,16 @@ usb_transfer_status_t usbipdcpp::Esp32DeviceHandler::error2trxstat(int e) {
 void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
     auto &callback_arg = *static_cast<esp32_callback_args *>(
         trx->context);
+    if (callback_arg.handler.all_transfer_should_stop)
+        return;
+
     //调了回调则当前包并未在发送，因此只要调了回调就先将其删了
     {
         std::lock_guard lock(callback_arg.handler.transferring_data_mutex);
         callback_arg.handler.transferring_data.erase(callback_arg.seqnum);
     }
-    auto unlink_found = callback_arg.session.get_unlink_seqnum(callback_arg.seqnum);
+
+    auto unlink_found = callback_arg.handler.session->get_unlink_seqnum(callback_arg.seqnum);
     // std::error_code ec;
     switch (trx->status) {
         case USB_TRANSFER_STATUS_COMPLETED:
@@ -576,7 +583,7 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
                 if (err != ESP_OK) {
                     SPDLOG_ERROR("seqnum为{}的传输重新提交失败：{}", callback_arg.seqnum, esp_err_to_name(err));
                     //提交epipe
-                    callback_arg.session.submit_ret_submit(
+                    callback_arg.handler.session->submit_ret_submit(
                             UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(
                                     callback_arg.seqnum));
                 }
@@ -591,7 +598,7 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
             callback_arg.handler.has_device = false;
             SPDLOG_INFO("device removed?");
 
-            callback_arg.session.submit_ret_submit(
+            callback_arg.handler.session->submit_ret_submit(
                     UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(
                             callback_arg.seqnum));
             //清理数据
@@ -652,13 +659,13 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
         }
 
 
-        callback_arg.session.submit_ret_submit(
+        callback_arg.handler.session->submit_ret_submit(
                 UsbIpResponse::UsbIpRetSubmit::create_ret_submit(
                         callback_arg.seqnum,
                         trxstat2error(trx->status),
                         0,
                         trx->num_isoc_packets,
-                        received_data,
+                        std::move(received_data),
                         iso_packet_descriptors
                         )
                 );
@@ -667,7 +674,7 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
         auto cmd_unlink_seqnum = std::get<1>(unlink_found);
 
         //发送ret_unlink
-        callback_arg.session.submit_ret_unlink_and_then_remove_seqnum_unlink(
+        callback_arg.handler.session->submit_ret_unlink_and_then_remove_seqnum_unlink(
                 UsbIpResponse::UsbIpRetUnlink::create_ret_unlink(
                         cmd_unlink_seqnum,
                         trxstat2error(trx->status)

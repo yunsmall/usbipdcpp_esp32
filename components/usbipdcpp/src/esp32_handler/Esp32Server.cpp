@@ -105,7 +105,7 @@ void usbipdcpp::Esp32Server::bind_host_device(usb_device_handle_t dev) {
     SPDLOG_DEBUG("该设备有{}个interface", active_config_desc->bNumInterfaces);
     std::vector<UsbInterface> interfaces;
     for (auto intf_i = 0; intf_i < active_config_desc->bNumInterfaces; intf_i++) {
-        auto alter_setting_num = usb_parse_interface_number_of_alternate(active_config_desc, intf_i);
+        [[maybe_unused]] auto alter_setting_num = usb_parse_interface_number_of_alternate(active_config_desc, intf_i);
         SPDLOG_DEBUG("第{}个interface有{}个altsetting", intf_i, alter_setting_num);
 
         int intf_offset;
@@ -294,6 +294,19 @@ void usbipdcpp::Esp32Server::stop() {
 usbipdcpp::Esp32Server::~Esp32Server() {
 }
 
+void usbipdcpp::Esp32Server::on_session_exit() {
+    std::lock_guard lock(devices_mutex);
+    for (auto it = using_devices.begin(); it != using_devices.end(); ++it) {
+        if (auto handler = it->second->handler) {
+            if (auto esp32_handler = std::dynamic_pointer_cast<Esp32DeviceHandler>(handler)) {
+                if (!esp32_handler->has_device) {
+                    it = using_devices.erase(it);
+                }
+            }
+        }
+    }
+}
+
 void usbipdcpp::Esp32Server::if_is_esp32_then_mark_removed(std::shared_ptr<AbstDeviceHandler> handler) {
     if (auto esp32_handler = std::dynamic_pointer_cast<Esp32DeviceHandler>(handler)) {
         esp32_handler->has_device = false;
@@ -316,6 +329,7 @@ void usbipdcpp::Esp32Server::remove_gone_device(usb_device_handle_t dev) {
         for (auto i = available_devices.begin(); i != available_devices.end(); ++i) {
             if ((*i)->busid == target_busid) {
                 if_is_esp32_then_mark_removed((*i)->handler);
+                //此处可以删除设备，因为此时因其还处于可用设备，因此没有session正在处理这个设备
                 available_devices.erase(i);
                 spdlog::info("从可用设备中移除目标设备");
                 return;
@@ -325,19 +339,11 @@ void usbipdcpp::Esp32Server::remove_gone_device(usb_device_handle_t dev) {
         for (auto i = using_devices.begin(); i != using_devices.end(); ++i) {
             if (i->first == target_busid) {
                 if_is_esp32_then_mark_removed(i->second->handler);
-                using_devices.erase(i);
-                spdlog::info("成功取消绑定");
+                //此处不能删除设备，因为此时session还未关闭，若删除设备会导致野指针
+                //标记已移除后若再收到一个URB会返回一个err，从而自然导致session关闭
+                SPDLOG_WARN("标记正在使用的设备为已移除");
                 return;
             }
         }
-        //对于相应session，transfer失败会返回NO_DEVICE，导致客户端尝试reset设备
-        //清空available_devices和using_devices会导致设备的引用减一，
-        //session自己会有一个device的共享指针，因此不会导致
     }
-    // {
-    //     std::lock_guard lock{session_list_mutex};
-    //     for (auto &session: sessions) {
-    //         session->immediately_stop();
-    //     }
-    // }
 }
