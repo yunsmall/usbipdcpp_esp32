@@ -111,7 +111,7 @@ void usbipdcpp::Esp32DeviceHandler::handle_control_urb(
         return;
     error_occurred:
         SPDLOG_ERROR("控制传输失败:{}", esp_err_to_name(err));
-        session->submit_ret_submit(
+        session.load()->submit_ret_submit(
                 UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum));
         return;
     }
@@ -119,7 +119,7 @@ void usbipdcpp::Esp32DeviceHandler::handle_control_urb(
         SPDLOG_INFO("拦截了控制包：{}", seqnum);
         //SPDLOG_INFO("拦截了包: {}", setup_packet.to_string());
         //返回空包
-        session->submit_ret_submit(UsbIpResponse::UsbIpRetSubmit::create_ret_submit(
+        session.load()->submit_ret_submit(UsbIpResponse::UsbIpRetSubmit::create_ret_submit(
                 seqnum,
                 static_cast<std::uint32_t>(UrbStatusType::StatusOK),
                 0,
@@ -189,7 +189,7 @@ void usbipdcpp::Esp32DeviceHandler::handle_bulk_transfer(std::uint32_t seqnum, c
     return;
 error_occurred:
     SPDLOG_ERROR("块传输失败，{}", esp_err_to_name(err));
-    session->submit_ret_submit(
+    session.load()->submit_ret_submit(
             UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum));
 }
 
@@ -250,7 +250,7 @@ error_occurred:
     SPDLOG_ERROR("中断传输失败，{}", esp_err_to_name(err));
     //不认为是错误，让服务器重置
     // ec = make_error_code(ErrorType::TRANSFER_ERROR);
-    session->submit_ret_submit(
+    session.load()->submit_ret_submit(
             UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum));
 }
 
@@ -323,7 +323,7 @@ void usbipdcpp::Esp32DeviceHandler::handle_isochronous_transfer(
     return;
 error_occurred:
     SPDLOG_ERROR("同步传输失败，{}", esp_err_to_name(err));
-    session->submit_ret_submit(
+    session.load()->submit_ret_submit(
             UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum));
 }
 
@@ -548,7 +548,7 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
         callback_arg.handler.transferring_data.erase(callback_arg.seqnum);
     }
 
-    auto unlink_found = callback_arg.handler.session->get_unlink_seqnum(callback_arg.seqnum);
+    auto unlink_found = callback_arg.handler.session.load()->get_unlink_seqnum(callback_arg.seqnum);
     // std::error_code ec;
     switch (trx->status) {
         case USB_TRANSFER_STATUS_COMPLETED:
@@ -583,7 +583,7 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
                 if (err != ESP_OK) {
                     SPDLOG_ERROR("seqnum为{}的传输重新提交失败：{}", callback_arg.seqnum, esp_err_to_name(err));
                     //提交epipe
-                    callback_arg.handler.session->submit_ret_submit(
+                    callback_arg.handler.session.load()->submit_ret_submit(
                             UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(
                                     callback_arg.seqnum));
                 }
@@ -598,7 +598,7 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
             callback_arg.handler.has_device = false;
             SPDLOG_INFO("device removed?");
 
-            callback_arg.handler.session->submit_ret_submit(
+            callback_arg.handler.session.load()->submit_ret_submit(
                     UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(
                             callback_arg.seqnum));
             //清理数据
@@ -659,7 +659,7 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
         }
 
 
-        callback_arg.handler.session->submit_ret_submit(
+        callback_arg.handler.session.load()->submit_ret_submit(
                 UsbIpResponse::UsbIpRetSubmit::create_ret_submit(
                         callback_arg.seqnum,
                         trxstat2error(trx->status),
@@ -674,7 +674,7 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
         auto cmd_unlink_seqnum = std::get<1>(unlink_found);
 
         //发送ret_unlink
-        callback_arg.handler.session->submit_ret_unlink_and_then_remove_seqnum_unlink(
+        callback_arg.handler.session.load()->submit_ret_unlink_and_then_remove_seqnum_unlink(
                 UsbIpResponse::UsbIpRetUnlink::create_ret_unlink(
                         cmd_unlink_seqnum,
                         trxstat2error(trx->status)
