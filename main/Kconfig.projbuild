@@ -1,0 +1,11 @@
+menu "Usbipdcpp WiFi Configuration"
+
+    config USBIPD_WIFI_SSID
+        string "Usbipd WiFi SSID"
+        default "default_ssid"
+
+    config USBIPD_WIFI_PASSWORD
+        string "Usbipd WiFi Password"
+        default "default_password"
+
+endmenu

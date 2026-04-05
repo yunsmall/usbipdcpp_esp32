@@ -11,7 +11,7 @@
 
 namespace usbipdcpp
 {
-    class Esp32Server : public Server
+    class Esp32Server
     {
     public:
         Esp32Server();
@@ -19,14 +19,15 @@ namespace usbipdcpp
         void init_client();
         void bind_host_device(usb_device_handle_t dev);
         void unbind_host_device(usb_device_handle_t device);
-        void start(asio::ip::tcp::endpoint& ep) override;
-        void stop() override;
+        void start(asio::ip::tcp::endpoint& ep);
+        void stop();
 
-        ~Esp32Server() override;
+        ~Esp32Server();
 
     protected:
-        void on_session_exit() override;
-        void if_is_esp32_then_mark_removed(std::shared_ptr<AbstDeviceHandler> handler);
+        Server server;
+
+        void on_session_exit();
         void remove_gone_device(usb_device_handle_t dev);
 
         static void client_event_callback(const usb_host_client_event_msg_t* event_msg, void* arg);

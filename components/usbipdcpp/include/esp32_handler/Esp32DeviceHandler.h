@@ -1,13 +1,16 @@
 #pragma once
 
-#include <map>
-#include <shared_mutex>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 
 #include <asio.hpp>
 #include <usb/usb_host.h>
 
 #include "DeviceHandler/DeviceHandler.h"
 #include "SetupPacket.h"
+#include "utils/ConcurrentTransferTracker.h"
+#include "utils/ObjectPool.h"
 #include "esp32_handler/tools.h"
 
 namespace usbipdcpp
@@ -26,24 +29,42 @@ namespace usbipdcpp
         void on_disconnection(error_code& ec) override;
         void handle_unlink_seqnum(std::uint32_t seqnum) override;
 
+#if !defined(USBIPDCPP_USE_COROUTINE) && defined(USBIPDCPP_ENABLE_BUSY_WAIT)
+        bool has_pending_transfers() const override
+        {
+            return transfer_tracker_.concurrent_count() > 0;
+        }
+#endif
+
+        bool is_device_removed() const override
+        {
+            return device_removed_;
+        }
+
+        void on_device_removed() override
+        {
+            device_removed_ = true;
+        }
+
     protected:
         void handle_control_urb(std::uint32_t seqnum, const UsbEndpoint& ep,
                                 std::uint32_t transfer_flags, std::uint32_t transfer_buffer_length,
-                                const SetupPacket& setup_packet, const data_type& req, std::error_code& ec) override;
+                                const SetupPacket& setup_packet, data_type&& transfer_buffer,
+                                std::error_code& ec) override;
         void handle_bulk_transfer(std::uint32_t seqnum, const UsbEndpoint& ep,
                                   UsbInterface& interface, std::uint32_t transfer_flags,
-                                  std::uint32_t transfer_buffer_length, const data_type& out_data,
+                                  std::uint32_t transfer_buffer_length, data_type&& transfer_buffer,
                                   std::error_code& ec) override;
         void handle_interrupt_transfer(std::uint32_t seqnum, const UsbEndpoint& ep,
                                        UsbInterface& interface, std::uint32_t transfer_flags,
-                                       std::uint32_t transfer_buffer_length, const data_type& out_data,
+                                       std::uint32_t transfer_buffer_length, data_type&& transfer_buffer,
                                        std::error_code& ec) override;
 
         void handle_isochronous_transfer(std::uint32_t seqnum,
                                          const UsbEndpoint& ep, UsbInterface& interface,
                                          std::uint32_t transfer_flags,
                                          std::uint32_t transfer_buffer_length,
-                                         const data_type& req,
+                                         data_type&& transfer_buffer,
                                          const std::vector<UsbIpIsoPacketDescriptor>& iso_packet_descriptors,
                                          std::error_code& ec) override;
         void cancel_all_transfer();
@@ -59,17 +80,19 @@ namespace usbipdcpp
          */
         esp_err_t sync_control_transfer(const SetupPacket& setup_packet) const;
 
-        esp_err_t tweak_clear_halt_cmd(const SetupPacket& setup_packet);
-        esp_err_t tweak_set_interface_cmd(const SetupPacket& setup_packet);
-        esp_err_t tweak_set_configuration_cmd(const SetupPacket& setup_packet);
-        esp_err_t tweak_reset_device_cmd(const SetupPacket& setup_packet);
+        int tweak_clear_halt_cmd(const SetupPacket& setup_packet);
+        int tweak_set_interface_cmd(const SetupPacket& setup_packet);
+        int tweak_set_configuration_cmd(const SetupPacket& setup_packet);
+        int tweak_reset_device_cmd(const SetupPacket& setup_packet);
 
         /**
-         * @brief 返回是否做了特殊操作
+         * @brief 处理特殊控制请求
          * @param setup_packet
-         * @return
+         * @return -1: 不需要 tweak，应该提交 transfer
+         *          0: tweak 成功，不需要提交 transfer
+         *         >0: tweak 失败（esp 错误码），不需要提交 transfer
          */
-        bool tweak_special_requests(const SetupPacket& setup_packet);
+        int tweak_special_requests(const SetupPacket& setup_packet);
 
         static uint8_t get_esp32_transfer_flags(uint32_t in);
 
@@ -78,18 +101,27 @@ namespace usbipdcpp
 
         struct esp32_callback_args
         {
-            Esp32DeviceHandler& handler;
+            Esp32DeviceHandler* handler = nullptr;
             std::uint32_t seqnum;
             usb_transfer_type_t transfer_type;
             bool is_out;
+            std::uint32_t original_transfer_buffer_length = 0;  // 保存原始请求长度
         };
 
         static void transfer_callback(usb_transfer_t* trx);
 
-        static const char* TAG;
+        // 对象池：64个
+        using CallbackArgsPool = ObjectPool<esp32_callback_args, 64, true>;
+        CallbackArgsPool callback_args_pool_;
 
-        std::map<std::uint32_t, usb_transfer_t*> transferring_data;
-        std::shared_mutex transferring_data_mutex;
+        // 用于等待所有传输完成
+        std::mutex transfer_complete_mutex_;
+        std::condition_variable transfer_complete_cv_;
+
+        // 分段锁传输追踪器
+        ConcurrentTransferTracker<usb_transfer_t*> transfer_tracker_;
+
+        static const char* TAG;
 
         usb_device_handle_t native_handle;
         usb_device_info_t device_info{};
@@ -97,6 +129,6 @@ namespace usbipdcpp
 
         std::atomic_bool all_transfer_should_stop = false;
 
-        std::atomic_bool has_device = true;
+        std::atomic_bool device_removed_ = false;
     };
 }

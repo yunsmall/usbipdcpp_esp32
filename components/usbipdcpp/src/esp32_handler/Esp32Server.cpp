@@ -16,6 +16,9 @@ const char *usbipdcpp::Esp32Server::TAG = "esp32_uspipdcpp_server";
 
 usbipdcpp::Esp32Server::Esp32Server():
     host_client_handle(nullptr) {
+    server.register_session_exit_callback([this]() {
+        this->on_session_exit();
+    });
 }
 
 void usbipdcpp::Esp32Server::init_client() {
@@ -143,13 +146,14 @@ void usbipdcpp::Esp32Server::bind_host_device(usb_device_handle_t dev) {
     }
 
     {
-        std::lock_guard lock(devices_mutex);
+        std::lock_guard lock(server.get_devices_mutex());
+        auto &server_available_devices = server.get_available_devices();
         auto current_device = std::make_shared<UsbDevice>(UsbDevice{
                 .path = std::format("/esp32/usbipdcpp/{}/{}", 1, dev_info.dev_addr),
                 .busid = esp32_get_device_busid(dev_info.dev_addr),
                 .bus_num = 1,
                 .dev_num = dev_info.dev_addr,
-                .speed = (std::uint32_t) esp32_speed_to_usb_speed(dev_info.speed),
+                .speed = static_cast<std::uint32_t>(esp32_speed_to_usb_speed(dev_info.speed)),
                 .vendor_id = device_descriptor->idVendor,
                 .product_id = device_descriptor->idProduct,
                 .device_bcd = device_descriptor->bcdDevice,
@@ -164,7 +168,7 @@ void usbipdcpp::Esp32Server::bind_host_device(usb_device_handle_t dev) {
                 .handler = {}
         });
         current_device->with_handler<Esp32DeviceHandler>(dev, host_client_handle);
-        available_devices.emplace_back(std::move(current_device));
+        server_available_devices.emplace_back(std::move(current_device));
     }
 }
 
@@ -177,8 +181,9 @@ void usbipdcpp::Esp32Server::unbind_host_device(usb_device_handle_t dev) {
     }
     auto taregt_busid = esp32_get_device_busid(dev_info.dev_addr);
     {
-        std::shared_lock lock(devices_mutex);
-        for (auto i = available_devices.begin(); i != available_devices.end(); ++i) {
+        std::shared_lock lock(server.get_devices_mutex());
+        auto &server_available_devices = server.get_available_devices();
+        for (auto i = server_available_devices.begin(); i != server_available_devices.end(); ++i) {
             if ((*i)->busid == taregt_busid) {
 
                 auto esp32_device_handler = std::dynamic_pointer_cast<Esp32DeviceHandler>((*i)->handler);
@@ -196,21 +201,21 @@ void usbipdcpp::Esp32Server::unbind_host_device(usb_device_handle_t dev) {
                         }
                     }
                 }
-                available_devices.erase(i);
+                server_available_devices.erase(i);
                 spdlog::info("成功取消绑定");
                 return;
             }
         }
         SPDLOG_WARN("可使用的设备中无目标设备");
 
-        if (using_devices.contains(taregt_busid)) {
+        if (server.get_using_devices().contains(taregt_busid)) {
             SPDLOG_WARN("正在使用的设备不支持解绑");
         }
     }
 }
 
 void usbipdcpp::Esp32Server::start(asio::ip::tcp::endpoint &ep) {
-    Server::start(ep);
+    server.start(ep);
     esp_pthread_cfg_t pthread_cfg = esp_pthread_get_default_config();
     pthread_cfg.pin_to_core = 1; // 设置核心1
     pthread_cfg.thread_name = "Esp32Server client_event_thread";
@@ -242,12 +247,12 @@ void usbipdcpp::Esp32Server::start(asio::ip::tcp::endpoint &ep) {
 }
 
 void usbipdcpp::Esp32Server::stop() {
-    Server::stop();
+    server.stop();
 
     {
-        std::shared_lock lock(devices_mutex);
-
-        for (auto avail_dev_i = available_devices.begin(); avail_dev_i != available_devices.end(); ++avail_dev_i) {
+        std::shared_lock lock(server.get_devices_mutex());
+        auto &server_available_devices = server.get_available_devices();
+        for (auto avail_dev_i = server_available_devices.begin(); avail_dev_i != server_available_devices.end(); ++avail_dev_i) {
             if (auto esp32_device_handler = std::dynamic_pointer_cast<Esp32DeviceHandler>((*avail_dev_i)->handler)) {
                 auto device = esp32_device_handler->native_handle;
                 const usb_config_desc_t *active_config_desc;
@@ -264,8 +269,8 @@ void usbipdcpp::Esp32Server::stop() {
                 }
             }
         }
-
-        for (auto i = using_devices.begin(); i != using_devices.end(); ++i) {
+        auto &server_using_devices = server.get_using_devices();
+        for (auto i = server_using_devices.begin(); i != server_using_devices.end(); ++i) {
             if (auto esp32_device_handler = std::dynamic_pointer_cast<Esp32DeviceHandler>(i->second->handler)) {
                 auto device = esp32_device_handler->native_handle;
                 const usb_config_desc_t *active_config_desc;
@@ -295,21 +300,16 @@ usbipdcpp::Esp32Server::~Esp32Server() {
 }
 
 void usbipdcpp::Esp32Server::on_session_exit() {
-    std::lock_guard lock(devices_mutex);
-    for (auto it = using_devices.begin(); it != using_devices.end(); ++it) {
+    std::lock_guard lock(server.get_devices_mutex());
+    auto &server_using_devices = server.get_using_devices();
+    for (auto it = server_using_devices.begin(); it != server_using_devices.end();) {
         if (auto handler = it->second->handler) {
-            if (auto esp32_handler = std::dynamic_pointer_cast<Esp32DeviceHandler>(handler)) {
-                if (!esp32_handler->has_device) {
-                    it = using_devices.erase(it);
-                }
+            if (handler->is_device_removed()) {
+                it = server_using_devices.erase(it);
+                continue;
             }
         }
-    }
-}
-
-void usbipdcpp::Esp32Server::if_is_esp32_then_mark_removed(std::shared_ptr<AbstDeviceHandler> handler) {
-    if (auto esp32_handler = std::dynamic_pointer_cast<Esp32DeviceHandler>(handler)) {
-        esp32_handler->has_device = false;
+        ++it;
     }
 }
 
@@ -325,23 +325,27 @@ void usbipdcpp::Esp32Server::remove_gone_device(usb_device_handle_t dev) {
         SPDLOG_TRACE("成功从所有设备中移除拔除的设备");
         auto target_busid = esp32_get_device_busid(address);
 
-        std::lock_guard lock2(devices_mutex);
-        for (auto i = available_devices.begin(); i != available_devices.end(); ++i) {
+        std::lock_guard lock2(server.get_devices_mutex());
+        auto &server_available_devices = server.get_available_devices();
+        for (auto i = server_available_devices.begin(); i != server_available_devices.end(); ++i) {
             if ((*i)->busid == target_busid) {
-                if_is_esp32_then_mark_removed((*i)->handler);
-                //此处可以删除设备，因为此时因其还处于可用设备，因此没有session正在处理这个设备
-                available_devices.erase(i);
+                // 此处可以删除设备，因为此时因其还处于可用设备，因此没有session正在处理这个设备
+                server_available_devices.erase(i);
                 spdlog::info("从可用设备中移除目标设备");
                 return;
             }
         }
         SPDLOG_WARN("可使用的设备中无目标设备");
-        for (auto i = using_devices.begin(); i != using_devices.end(); ++i) {
+        auto &server_using_devices = server.get_using_devices();
+        for (auto i = server_using_devices.begin(); i != server_using_devices.end(); ++i) {
             if (i->first == target_busid) {
-                if_is_esp32_then_mark_removed(i->second->handler);
-                //此处不能删除设备，因为此时session还未关闭，若删除设备会导致野指针
-                //标记已移除后若再收到一个URB会返回一个err，从而自然导致session关闭
-                SPDLOG_WARN("标记正在使用的设备为已移除");
+                if (auto handler = i->second->handler) {
+                    // 通过 AbstDeviceHandler 接口通知
+                    handler->on_device_removed();
+                    // 强制关闭 Session
+                    SPDLOG_WARN("正在使用的设备被拔出，强制关闭 Session: {}", target_busid);
+                    handler->trigger_session_stop();
+                }
                 return;
             }
         }

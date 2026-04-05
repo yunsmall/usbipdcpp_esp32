@@ -19,8 +19,13 @@ idf_component_register(SRCS ${USBIPDCPP_ALL_SRC_FILES}
         INCLUDE_DIRS ${usbipdcpp_DIR}/include ${usbipdcpp_DIR}/examples/mock_mouse include
         REQUIRES asio lwip sock_utils spdlog usb pthread)
 
-add_compile_definitions(
+target_compile_definitions(
+        ${COMPONENT_LIB} PRIVATE
         #        SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE
         SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_INFO
         NDEBUG
+)
+
+target_compile_options(${COMPONENT_LIB} PRIVATE
+        -Wno-error=maybe-uninitialized
 )

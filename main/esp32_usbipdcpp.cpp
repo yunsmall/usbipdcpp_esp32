@@ -1,3 +1,5 @@
+#include "sdkconfig.h"
+
 #include <iostream>
 #include <thread>
 #include <semaphore>
@@ -30,8 +32,9 @@ std::atomic_bool wifi_thread_should_stop = false;
 std::binary_semaphore wifi_reconnect_semaphore{0};
 std::thread wifi_connect_thread;
 
-auto wifi_ssid = "your ssid";
-auto wifi_passwd = "your passwd";
+auto wifi_ssid = CONFIG_USBIPD_WIFI_SSID;
+
+auto wifi_passwd = CONFIG_USBIPD_WIFI_PASSWORD;
 
 constexpr std::uint16_t listening_port = 3240;
 
@@ -119,7 +122,7 @@ void init_usb_host() {
     ESP_LOGI(TAG, "Installing USB Host Library");
     usb_host_config_t host_config = {
             .skip_phy_setup = false,
-            .intr_flags = ESP_INTR_FLAG_LEVEL1,
+            .intr_flags = ESP_INTR_FLAG_LEVEL3,
             .enum_filter_cb = nullptr,
     };
     ESP_ERROR_CHECK(usb_host_install(&host_config));
@@ -129,6 +132,7 @@ void init_usb_host() {
     cfg.prio = 10;
     cfg.pin_to_core = 1; // 设置核心1
     cfg.thread_name = "usb_host_event_thread";
+    cfg.stack_size = 4096;
     esp_pthread_set_cfg(&cfg);
 
     usb_host_event_thread = std::thread([]() {
