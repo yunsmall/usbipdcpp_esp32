@@ -214,6 +214,9 @@ int thread_main() {
     ESP_LOGI(TAG, "初始化所有设备");
     init_all();
 
+    ESP_LOGI(TAG, "连接wifi ssid:%s", wifi_ssid);
+    ESP_LOGI(TAG, "连接wifi password:%s", wifi_passwd);
+
     spdlog::set_level(spdlog::level::trace);
 
     asio::ip::tcp::endpoint listen_endpoint(asio::ip::tcp::v4(), listening_port);

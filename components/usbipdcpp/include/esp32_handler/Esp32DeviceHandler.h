@@ -15,7 +15,7 @@
 
 namespace usbipdcpp
 {
-    class Esp32DeviceHandler : public DeviceHandlerBase
+    class Esp32DeviceHandler : public AbstDeviceHandler
     {
         friend class Esp32Server;
 
@@ -27,9 +27,9 @@ namespace usbipdcpp
 
         void on_new_connection(Session& current_session, error_code& ec) override;
         void on_disconnection(error_code& ec) override;
-        void handle_unlink_seqnum(std::uint32_t seqnum) override;
+        void handle_unlink_seqnum(std::uint32_t unlink_seqnum, std::uint32_t cmd_seqnum) override;
 
-#if !defined(USBIPDCPP_USE_COROUTINE) && defined(USBIPDCPP_ENABLE_BUSY_WAIT)
+#ifdef USBIPDCPP_ENABLE_BUSY_WAIT
         bool has_pending_transfers() const override
         {
             return transfer_tracker_.concurrent_count() > 0;
@@ -109,6 +109,9 @@ namespace usbipdcpp
         };
 
         static void transfer_callback(usb_transfer_t* trx);
+
+        // 清理传输资源（供发送线程调用）
+        static void cleanup_transfer_resources(void* context, void* transfer);
 
         // 对象池：64个
         using CallbackArgsPool = ObjectPool<esp32_callback_args, 64, true>;

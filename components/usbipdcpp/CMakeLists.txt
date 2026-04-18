@@ -26,6 +26,11 @@ target_compile_definitions(
         NDEBUG
 )
 
+#target_compile_definitions(
+#        ${COMPONENT_LIB} PUBLIC
+#        USBIPDCPP_FORCE_TRACK_PACKAGE
+#)
+
 target_compile_options(${COMPONENT_LIB} PRIVATE
         -Wno-error=maybe-uninitialized
 )
