@@ -748,15 +748,20 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
         }
 
 
-        callback_arg->handler->session->submit_ret_submit(
-                UsbIpResponse::UsbIpRetSubmit::create_ret_submit(
-                        callback_arg->seqnum,
-                        trxstat2error(trx->status),
-                        actual_data_len,
-                        0,
-                        trx->num_isoc_packets,
-                        std::move(response_buffer),
-                        std::move(iso_packet_descriptors)
+        callback_arg->handler->session->submit_session_response(
+                SessionResponse::with_cleanup(
+                        UsbIpResponse::UsbIpRetSubmit::create_ret_submit(
+                                callback_arg->seqnum,
+                                trxstat2error(trx->status),
+                                actual_data_len,
+                                0,
+                                trx->num_isoc_packets,
+                                std::move(response_buffer),
+                                std::move(iso_packet_descriptors)
+                                ),
+                        callback_arg,
+                        trx,
+                        &Esp32DeviceHandler::cleanup_transfer_resources
                         )
                 );
     }

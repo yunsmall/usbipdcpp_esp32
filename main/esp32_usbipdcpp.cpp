@@ -86,8 +86,8 @@ void start_always_try_connecting_to_wifi() {
         &instance_got_ip));
 
     wifi_config_t wifi_config{};
-    strncpy(reinterpret_cast<char *>(wifi_config.sta.ssid), wifi_ssid, std::size(wifi_config.sta.ssid));
-    strncpy(reinterpret_cast<char *>(wifi_config.sta.password), wifi_passwd, std::size(wifi_config.sta.password));
+    strncpy(reinterpret_cast<char *>(wifi_config.sta.ssid), wifi_ssid, std::size(wifi_config.sta.ssid)-1);
+    strncpy(reinterpret_cast<char *>(wifi_config.sta.password), wifi_passwd, std::size(wifi_config.sta.password)-1);
     wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
     wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
 
@@ -283,7 +283,10 @@ int thread_main() {
     //     std::this_thread::sleep_for(std::chrono::seconds(1));
     // }
     while (true) {
-        std::this_thread::sleep_for(chrono::seconds(3600));
+        std::this_thread::sleep_for(chrono::seconds(20));
+        ESP_LOGI(TAG, "Free heap: %lu, Min free heap: %lu",
+                 esp_get_free_heap_size(),
+                 esp_get_minimum_free_heap_size());
     }
 
     server.stop();

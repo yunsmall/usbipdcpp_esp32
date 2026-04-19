@@ -16,3 +16,11 @@ dependencies:
   #   public: true
   espressif/asio: ^1.32.0
   javivilarroig/spdlog: ^1.14.1
+  espressif/esp_wifi_remote:
+    version: '*'
+    rules:
+      - if: "target == esp32p4"
+  espressif/esp_hosted:
+    version: '*'
+    rules:
+      - if: "target == esp32p4"

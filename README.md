@@ -3,9 +3,13 @@
 [![ESP-IDF](https://img.shields.io/badge/ESP--IDF-5.5-blue)](https://github.com/espressif/esp-idf)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-An USB/IP server implementation for ESP32-S3 based on [usbipdcpp](https://github.com/yunsmall/usbipdcpp) library. This project serves as a practical example of using usbipdcpp on ESP32 platforms.
+An USB/IP server implementation for ESP32-S3 and ESP32-P4 based on [usbipdcpp](https://github.com/yunsmall/usbipdcpp) library. This project serves as a practical example of using usbipdcpp on ESP32 platforms.
 
-> **Note**: ESP32-S3 USB OTG only supports **Full Speed** (12Mbps) and **Low Speed** (1.5Mbps) devices. High Speed (480Mbps) devices may not work correctly.
+> **Note**: USB device compatibility depends on the ESP32 chip's USB PHY speed support:
+> - **ESP32-S3**: Supports **Full Speed** (12Mbps) and **Low Speed** (1.5Mbps) devices
+> - **ESP32-P4**: Supports **High Speed** (480Mbps), **Full Speed** (12Mbps) and **Low Speed** (1.5Mbps) devices
+>
+> High Speed devices (480Mbps) may not work correctly on ESP32-S3 due to PHY limitations.
 
 English | [中文](README-zh.md)
 
@@ -20,9 +24,13 @@ English | [中文](README-zh.md)
 ## 📋 Requirements
 
 ### Hardware
-- ESP32-S3 development board (USB OTG supported)
+- ESP32-S3 or ESP32-P4 development board (USB OTG supported)
 - USB devices (keyboards, mice, mass storage, etc.)
 - USB hub (optional, for multiple devices)
+
+> **Speed Compatibility**: Ensure your ESP32 chip's USB PHY supports the USB speed type of your device. For example, High Speed UVC webcams require ESP32-P4.
+
+> **Flash Size**: Default configuration assumes ESP32-S3 (8MB flash) and ESP32-P4 (32MB flash). Modify via `idf.py menuconfig` → `Serial flasher config` → `Flash size` if needed.
 
 ### Software
 - ESP-IDF v5.5
@@ -54,6 +62,18 @@ Navigate to `Usbipdcpp WiFi Configuration` and set:
 ```bash
 idf.py build flash monitor
 ```
+
+For specific chip targets, use the appropriate sdkconfig defaults:
+
+```bash
+# For ESP32-S3
+idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults.esp32s3" build flash monitor
+
+# For ESP32-P4
+idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults.esp32p4" build flash monitor
+```
+
+> If the default sdkconfig doesn't take effect, explicitly specify it with `-DSDKCONFIG_DEFAULTS`.
 
 ### 4. Connect from Linux Client
 
@@ -101,13 +121,15 @@ sudo usbip attach -r <ESP32_IP> -b <BUSID>
 
 ## 📝 Tested Devices
 
-| Device Type | Status |
-|-------------|--------|
-| USB Keyboard | ✅ Working |
-| USB Mouse | ✅ Working |
-| USB Flash Drive (MSC) | 🔄 Testing |
-| USB Audio | 🔄 Testing |
-| USB Webcam (UVC) | 🔄 Testing |
+| Device Type | Status | Notes |
+|-------------|--------|-------|
+| USB Keyboard | ✅ Working | |
+| USB Mouse | ✅ Working | |
+| USB Flash Drive (MSC) | ✅ Working | Bulk transfer tested |
+| USB Audio | 🔄 Testing | |
+| USB Webcam (UVC) | 🔄 Testing | Requires ESP32-P4 for High Speed |
+
+> Bulk and interrupt transfers have been verified to work correctly. Ensure your ESP32 chip's USB PHY supports the target device's speed type.
 
 ## 📚 Related Project
 

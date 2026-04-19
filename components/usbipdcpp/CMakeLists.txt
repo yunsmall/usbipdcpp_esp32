@@ -19,11 +19,14 @@ idf_component_register(SRCS ${USBIPDCPP_ALL_SRC_FILES}
         INCLUDE_DIRS ${usbipdcpp_DIR}/include ${usbipdcpp_DIR}/examples/mock_mouse include
         REQUIRES asio lwip sock_utils spdlog usb pthread)
 
+math(EXPR USBIPDCPP_MAX_TRANSFER_BUFFER_SIZE "2*1024*1024")
+
 target_compile_definitions(
         ${COMPONENT_LIB} PRIVATE
         #        SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE
         SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_INFO
         NDEBUG
+        USBIPDCPP_MAX_TRANSFER_BUFFER_SIZE=${USBIPDCPP_MAX_TRANSFER_BUFFER_SIZE}
 )
 
 #target_compile_definitions(
