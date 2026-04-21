@@ -283,7 +283,7 @@ int thread_main() {
     //     std::this_thread::sleep_for(std::chrono::seconds(1));
     // }
     while (true) {
-        std::this_thread::sleep_for(chrono::seconds(20));
+        std::this_thread::sleep_for(chrono::seconds(5));
         ESP_LOGI(TAG, "Free heap: %lu, Min free heap: %lu",
                  esp_get_free_heap_size(),
                  esp_get_minimum_free_heap_size());

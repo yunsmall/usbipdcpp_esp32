@@ -3,6 +3,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <unordered_map>
 
 #include <asio.hpp>
 #include <usb/usb_host.h>
@@ -46,26 +47,36 @@ namespace usbipdcpp
             device_removed_ = true;
         }
 
+        // ========== transfer_handle 操作覆盖实现 ==========
+        void* alloc_transfer_handle(std::size_t buffer_length, int num_iso_packets, const UsbIpHeaderBasic& header, const SetupPacket& setup_packet) override;
+        void* get_transfer_buffer(void* transfer_handle) override;
+        std::size_t get_actual_length(void* transfer_handle) override;
+        std::size_t get_read_data_offset(void* transfer_handle) override;
+        std::size_t get_write_data_offset(const UsbIpHeaderBasic& header) override;
+        UsbIpIsoPacketDescriptor get_iso_descriptor(void* transfer_handle, int index) override;
+        void set_iso_descriptor(void* transfer_handle, int index, const UsbIpIsoPacketDescriptor& desc) override;
+        void free_transfer_handle(void* transfer_handle) override;
+
     protected:
         void handle_control_urb(std::uint32_t seqnum, const UsbEndpoint& ep,
                                 std::uint32_t transfer_flags, std::uint32_t transfer_buffer_length,
-                                const SetupPacket& setup_packet, data_type&& transfer_buffer,
+                                const SetupPacket& setup_packet, TransferHandle transfer,
                                 std::error_code& ec) override;
         void handle_bulk_transfer(std::uint32_t seqnum, const UsbEndpoint& ep,
                                   UsbInterface& interface, std::uint32_t transfer_flags,
-                                  std::uint32_t transfer_buffer_length, data_type&& transfer_buffer,
+                                  std::uint32_t transfer_buffer_length, TransferHandle transfer,
                                   std::error_code& ec) override;
         void handle_interrupt_transfer(std::uint32_t seqnum, const UsbEndpoint& ep,
                                        UsbInterface& interface, std::uint32_t transfer_flags,
-                                       std::uint32_t transfer_buffer_length, data_type&& transfer_buffer,
+                                       std::uint32_t transfer_buffer_length, TransferHandle transfer,
                                        std::error_code& ec) override;
 
         void handle_isochronous_transfer(std::uint32_t seqnum,
                                          const UsbEndpoint& ep, UsbInterface& interface,
                                          std::uint32_t transfer_flags,
                                          std::uint32_t transfer_buffer_length,
-                                         data_type&& transfer_buffer,
-                                         const std::vector<UsbIpIsoPacketDescriptor>& iso_packet_descriptors,
+                                         TransferHandle transfer,
+                                         int num_iso_packets,
                                          std::error_code& ec) override;
         void cancel_all_transfer();
         void cancel_endpoint_all_transfers(uint8_t bEndpointAddress);
@@ -106,12 +117,10 @@ namespace usbipdcpp
             usb_transfer_type_t transfer_type;
             bool is_out;
             std::uint32_t original_transfer_buffer_length = 0;  // 保存原始请求长度
+            TransferHandle transfer;  // 拥有 transfer 的所有权
         };
 
         static void transfer_callback(usb_transfer_t* trx);
-
-        // 清理传输资源（供发送线程调用）
-        static void cleanup_transfer_resources(void* context, void* transfer);
 
         // 对象池：64个
         using CallbackArgsPool = ObjectPool<esp32_callback_args, 64, true>;
@@ -133,5 +142,8 @@ namespace usbipdcpp
         std::atomic_bool all_transfer_should_stop = false;
 
         std::atomic_bool device_removed_ = false;
+
+        // 端点 MPS 查找表：端点地址 -> max_packet_size
+        std::unordered_map<std::uint8_t, std::uint16_t> endpoint_mps_map_;
     };
 }

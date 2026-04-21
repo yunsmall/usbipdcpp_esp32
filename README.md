@@ -1,7 +1,7 @@
 # ESP32 USB/IP Server
 
 [![ESP-IDF](https://img.shields.io/badge/ESP--IDF-5.5-blue)](https://github.com/espressif/esp-idf)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 An USB/IP server implementation for ESP32-S3 and ESP32-P4 based on [usbipdcpp](https://github.com/yunsmall/usbipdcpp) library. This project serves as a practical example of using usbipdcpp on ESP32 platforms.
 
@@ -18,7 +18,7 @@ English | [中文](README-zh.md)
 - 🔄 **Transparent USB Forwarding** - Export local USB devices to remote machines via USB/IP protocol
 - 🔌 **Hot-plug Support** - Automatic device detection, enumeration, and cleanup on removal
 - 🌐 **Multi-device Support** - USB hubs supported, multiple devices can be exported simultaneously
-- ⚡ **High Performance** - Optimized for bulk and interrupt transfers
+- ⚡ **Zero-Copy Performance** - Direct DMA buffer access eliminates data copying overhead, achieving optimal throughput
 - 🛡️ **Robust Connection Handling** - Automatic cleanup when devices are unplugged during active sessions
 
 ## 📋 Requirements
@@ -131,10 +131,21 @@ sudo usbip attach -r <ESP32_IP> -b <BUSID>
 
 > Bulk and interrupt transfers have been verified to work correctly. Ensure your ESP32 chip's USB PHY supports the target device's speed type.
 
+## ⚡ Performance Optimization
+
+This implementation leverages usbipdcpp v1.0.1's zero-copy architecture for maximum throughput:
+
+- **Direct DMA Buffer Access**: USB transfer buffers are allocated in DMA-capable memory and accessed directly for network I/O, eliminating intermediate data copies
+- **RAII Transfer Management**: `TransferHandle` automatically manages buffer lifecycle, ensuring proper cleanup without manual memory management
+- **ESP32-Specific Optimizations**:
+  - Bulk/Interrupt IN transfers aligned to endpoint Max Packet Size for hardware efficiency
+  - Control transfer buffers pre-allocated with setup packet space
+  - Object pooling for callback structures reduces allocation overhead
+
 ## 📚 Related Project
 
 - [usbipdcpp](https://github.com/yunsmall/usbipdcpp) - A cross-platform USB/IP protocol library. This project is an ESP32 implementation using usbipdcpp.
 
 ## 📄 License
 
-MIT License
+Apache License 2.0

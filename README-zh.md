@@ -1,7 +1,7 @@
 # ESP32 USB/IP 服务器
 
 [![ESP-IDF](https://img.shields.io/badge/ESP--IDF-5.5-blue)](https://github.com/espressif/esp-idf)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 基于 [usbipdcpp](https://github.com/yunsmall/usbipdcpp) 库的 ESP32-S3 和 ESP32-P4 USB/IP 服务器实现。本项目是 usbipdcpp 在 ESP32 平台上的使用示例。
 
@@ -18,7 +18,7 @@
 - 🔄 **透明 USB 转发** - 通过 USB/IP 协议将本地 USB 设备导出到远程机器
 - 🔌 **热插拔支持** - 自动检测设备、枚举、拔出时自动清理
 - 🌐 **多设备支持** - 支持 USB 集线器，可同时导出多个设备
-- ⚡ **高性能传输** - 针对批量传输和中断传输优化
+- ⚡ **零拷贝高性能** - 直接访问 DMA 缓冲区，消除数据拷贝开销，实现极致吞吐量
 - 🛡️ **健壮的连接处理** - 设备在会话中被拔出时自动清理资源
 
 ## 📋 环境要求
@@ -131,10 +131,21 @@ sudo usbip attach -r <ESP32_IP> -b <BUSID>
 
 > Bulk 和中断传输已验证可正常工作。请确保 ESP32 芯片的 USB PHY 支持目标设备的速度类型。
 
+## ⚡ 性能优化
+
+本项目利用 usbipdcpp v1.0.1 的零拷贝架构实现最大吞吐量：
+
+- **直接 DMA 缓冲区访问**：USB 传输缓冲区分配在 DMA 可访问内存中，直接用于网络 I/O，消除中间数据拷贝
+- **RAII 传输管理**：`TransferHandle` 自动管理缓冲区生命周期，无需手动内存管理
+- **ESP32 专属优化**：
+  - Bulk/Interrupt IN 传输按端点 Max Packet Size 对齐，提升硬件效率
+  - 控制传输缓冲区预分配 setup packet 空间
+  - 回调结构体对象池减少分配开销
+
 ## 📚 相关项目
 
 - [usbipdcpp](https://github.com/yunsmall/usbipdcpp) - 跨平台 USB/IP 协议库。本项目是使用 usbipdcpp 在 ESP32 上的实现示例。
 
 ## 📄 许可证
 
-MIT License
+Apache License 2.0
