@@ -120,7 +120,9 @@ void usbipdcpp::Esp32DeviceHandler::on_new_connection(Session &current_session, 
     // 控制端点 0 的 MPS
     if (handle_device.ep0_in.max_packet_size > 0) {
         endpoint_mps_map_[0x80] = handle_device.ep0_in.max_packet_size;
-        endpoint_mps_map_[0x00] = handle_device.ep0_in.max_packet_size;
+    }
+    if (handle_device.ep0_out.max_packet_size > 0) {
+        endpoint_mps_map_[0x00] = handle_device.ep0_out.max_packet_size;
     }
 }
 
