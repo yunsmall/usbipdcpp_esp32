@@ -189,25 +189,6 @@ void init_all() {
     init_usb_host();
 }
 
-asio::awaitable<void> handle_connection(asio::ip::tcp::socket &&socket) {
-    while (true) {
-        try {
-            std::array<char, 1> buffer{};
-            co_await asio::async_read(socket, asio::buffer(buffer), asio::use_awaitable);
-            co_await asio::async_write(socket, asio::buffer(buffer), asio::use_awaitable);
-        } catch (std::exception &e) {
-            ESP_LOGE(TAG, "socket exception occurs: %s", e.what());
-            break;
-        }
-    }
-    std::error_code ignore_ec;
-    ESP_LOGI(TAG, "尝试关闭socket");
-    socket.shutdown(asio::ip::tcp::socket::shutdown_both, ignore_ec);
-    socket.close(ignore_ec);
-
-    co_return;
-}
-
 using namespace usbipdcpp;
 
 int thread_main() {
