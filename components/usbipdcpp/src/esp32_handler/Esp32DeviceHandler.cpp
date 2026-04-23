@@ -299,7 +299,10 @@ void usbipdcpp::Esp32DeviceHandler::handle_bulk_transfer(std::uint32_t seqnum, c
     trx->num_bytes = aligned_length;
     trx->flags = get_esp32_transfer_flags(transfer_flags);
     if (is_out) {
-        trx->flags &= USB_TRANSFER_FLAG_ZERO_PACK;
+        // On bulk OUT, USB_TRANSFER_FLAG_ZERO_PACK asks the host to append a
+        // zero-length packet when the payload is an exact multiple of the
+        // endpoint MPS, so the device sees a clean end-of-transfer marker.
+        trx->flags |= USB_TRANSFER_FLAG_ZERO_PACK;
     }
 
     transfer_tracker_.register_transfer(seqnum, trx, ep.address);
