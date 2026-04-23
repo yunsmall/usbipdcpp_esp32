@@ -20,7 +20,6 @@
 #include <pthread.h>
 
 #include "esp32_handler/Esp32Server.h"
-#include "mock_mouse.h"
 
 
 using namespace std;
