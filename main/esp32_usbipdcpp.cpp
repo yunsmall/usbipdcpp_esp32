@@ -1,5 +1,6 @@
 #include "sdkconfig.h"
 
+#include <cstring>
 #include <iostream>
 #include <thread>
 #include <semaphore>
@@ -214,7 +215,11 @@ int thread_main() {
     init_all();
 
     ESP_LOGI(TAG, "连接wifi ssid:%s", wifi_ssid);
-    ESP_LOGI(TAG, "连接wifi password:%s", wifi_passwd);
+    // The password is intentionally not logged — serial logs are often shared
+    // (in issue reports, screen shares, crash dumps) and this would leak the
+    // WiFi credential. If you need to verify the configured password for
+    // debugging, read CONFIG_USBIPD_WIFI_PASSWORD from sdkconfig directly.
+    ESP_LOGI(TAG, "连接wifi password: <redacted, length=%d>", (int)strlen(wifi_passwd));
 
     spdlog::set_level(spdlog::level::trace);
 
