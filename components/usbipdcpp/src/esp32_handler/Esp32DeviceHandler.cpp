@@ -120,7 +120,9 @@ void usbipdcpp::Esp32DeviceHandler::on_new_connection(Session &current_session, 
     // 控制端点 0 的 MPS
     if (handle_device.ep0_in.max_packet_size > 0) {
         endpoint_mps_map_[0x80] = handle_device.ep0_in.max_packet_size;
-        endpoint_mps_map_[0x00] = handle_device.ep0_in.max_packet_size;
+    }
+    if (handle_device.ep0_out.max_packet_size > 0) {
+        endpoint_mps_map_[0x00] = handle_device.ep0_out.max_packet_size;
     }
 }
 
@@ -299,7 +301,10 @@ void usbipdcpp::Esp32DeviceHandler::handle_bulk_transfer(std::uint32_t seqnum, c
     trx->num_bytes = aligned_length;
     trx->flags = get_esp32_transfer_flags(transfer_flags);
     if (is_out) {
-        trx->flags &= USB_TRANSFER_FLAG_ZERO_PACK;
+        // On bulk OUT, USB_TRANSFER_FLAG_ZERO_PACK asks the host to append a
+        // zero-length packet when the payload is an exact multiple of the
+        // endpoint MPS, so the device sees a clean end-of-transfer marker.
+        trx->flags |= USB_TRANSFER_FLAG_ZERO_PACK;
     }
 
     transfer_tracker_.register_transfer(seqnum, trx, ep.address);
@@ -549,11 +554,28 @@ int usbipdcpp::Esp32DeviceHandler::tweak_set_interface_cmd(const SetupPacket &se
     uint16_t alternate = setup_packet.value;
 
     SPDLOG_DEBUG("set_interface: inf {} alt {}", interface, alternate);
-    SPDLOG_ERROR("不支持的控制传输 set_interface");
-    ESP_LOGE(TAG, "不支持的控制传输 set_interface");
 
-    // ESP-IDF 暂不支持动态切换 alternate setting
-    return ESP_OK;
+    // ESP-IDF's usb_host_lib does not currently support dynamic alt-setting
+    // switches. Handling depends on the requested alternate:
+    //
+    //   * alt 0 — the interface is already at alt 0 after SET_CONFIGURATION,
+    //     so a client asking for alt 0 is effectively a no-op. Report
+    //     success so standard Linux-kernel enumeration (which issues
+    //     SET_INTERFACE(alt=0) for interfaces with multiple alt-settings)
+    //     proceeds cleanly.
+    //
+    //   * alt != 0 — we cannot honor the request. Previously this returned
+    //     ESP_OK and the client believed the switch succeeded, which is
+    //     silent data corruption for devices that have meaningful
+    //     alt-settings (UVC cameras, class-compound audio devices, etc.).
+    //     Return an error instead so the client sees the failure.
+    if (alternate == 0) {
+        SPDLOG_DEBUG("set_interface alt=0 treated as no-op (already at default alt)");
+        return ESP_OK;
+    }
+    SPDLOG_ERROR("set_interface alt={} not supported by ESP-IDF usb_host_lib", alternate);
+    ESP_LOGE(TAG, "set_interface alt=%u not supported by ESP-IDF usb_host_lib", alternate);
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 int usbipdcpp::Esp32DeviceHandler::tweak_set_configuration_cmd(const SetupPacket &setup_packet) {
