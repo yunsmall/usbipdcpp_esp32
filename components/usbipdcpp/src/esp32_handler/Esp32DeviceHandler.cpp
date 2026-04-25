@@ -149,7 +149,11 @@ void usbipdcpp::Esp32DeviceHandler::on_disconnection(error_code &ec) {
         });
     }
 
-    callback_args_pool_.clear();
+    // Note: callback_args_pool_ is intentionally NOT cleared here. ObjectPool::clear()
+    // permanently destroys all preallocated slots and there is no re-init path, so
+    // clearing on session disconnect would force every subsequent alloc() in a
+    // following session to fall back to heap `new`, defeating the purpose of the pool.
+    // The pool's lifetime matches the handler's; its destructor releases the slots.
     AbstDeviceHandler::on_disconnection(ec);
 }
 
