@@ -215,10 +215,40 @@ void usbipdcpp::Esp32Server::unbind_host_device(usb_device_handle_t dev) {
 }
 
 void usbipdcpp::Esp32Server::start(asio::ip::tcp::endpoint &ep) {
+    // 设置线程栈，减少内存占用。加锁防止多线程并发修改全局 pthread 配置
+    server.set_before_thread_create_callback([this](ThreadPurpose purpose) {
+        thread_cfg_mutex.lock();
+        esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
+        cfg.pin_to_core = 1;
+        switch (purpose) {
+            case ThreadPurpose::NetworkIO:
+                cfg.stack_size = 4096;
+                cfg.thread_name = "usbipd_nio";
+                break;
+            case ThreadPurpose::SessionMain:
+                cfg.stack_size = 8192;
+                cfg.thread_name = "usbipd_sess";
+                break;
+            case ThreadPurpose::SessionSender:
+                cfg.stack_size = 8192;
+                cfg.thread_name = "usbipd_send";
+                break;
+        }
+        esp_pthread_set_cfg(&cfg);
+    });
+    server.set_after_thread_create_callback([this](ThreadPurpose, std::thread&) {
+        esp_pthread_cfg_t default_cfg = esp_pthread_get_default_config();
+        esp_pthread_set_cfg(&default_cfg);
+        thread_cfg_mutex.unlock();
+    });
+
     server.start(ep);
+
+    thread_cfg_mutex.lock();
     esp_pthread_cfg_t pthread_cfg = esp_pthread_get_default_config();
-    pthread_cfg.pin_to_core = 1; // 设置核心1
+    pthread_cfg.pin_to_core = 1;
     pthread_cfg.thread_name = "Esp32Server client_event_thread";
+    pthread_cfg.stack_size = 5120;
     esp_pthread_set_cfg(&pthread_cfg);
     client_event_thread = std::thread([this]() {
         try {
@@ -244,6 +274,7 @@ void usbipdcpp::Esp32Server::start(asio::ip::tcp::endpoint &ep) {
     });
     esp_pthread_cfg_t default_cfg = esp_pthread_get_default_config();
     esp_pthread_set_cfg(&default_cfg);
+    thread_cfg_mutex.unlock();
 }
 
 void usbipdcpp::Esp32Server::stop() {

@@ -3,6 +3,7 @@
 #include <usb/usb_host.h>
 
 #include <shared_mutex>
+#include <mutex>
 
 #include <asio.hpp>
 
@@ -40,6 +41,8 @@ namespace usbipdcpp
         std::map<std::uint8_t, usb_device_handle_t> host_devices;
         std::shared_mutex all_host_devices_mutex;
         usb_host_client_handle_t host_client_handle;
+
+        std::mutex thread_cfg_mutex;
 
         static const char* TAG;
     };
