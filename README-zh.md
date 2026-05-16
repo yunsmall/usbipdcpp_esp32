@@ -150,6 +150,14 @@ sudo usbip attach -r <ESP32_IP> -b <BUSID>
 
 - [usbipdcpp](https://github.com/yunsmall/usbipdcpp) - 跨平台 USB/IP 协议库。本项目是使用 usbipdcpp 在 ESP32 上的实现示例。
 
+## 📢 商业使用
+
+如果将本项目用于产品，请在产品介绍的醒目位置注明以下信息：
+
+- 项目地址：`https://github.com/yunsmall/usbipdcpp_esp32`
+- 作者：`yunsmall`（GitHub）
+- 联系方式：`yun_small@163.com`
+
 ## 📄 许可证
 
 Apache License 2.0

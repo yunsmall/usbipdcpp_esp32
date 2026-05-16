@@ -150,6 +150,14 @@ This implementation leverages usbipdcpp v1.0.1's zero-copy architecture for maxi
 
 - [usbipdcpp](https://github.com/yunsmall/usbipdcpp) - A cross-platform USB/IP protocol library. This project is an ESP32 implementation using usbipdcpp.
 
+## 📢 Commercial Use
+
+If you use this project in a product, please display the following information prominently in your product documentation or about page:
+
+- Project URL: `https://github.com/yunsmall/usbipdcpp_esp32`
+- Author: `yunsmall` (GitHub)
+- Contact: `yun_small@163.com`
+
 ## 📄 License
 
 Apache License 2.0
