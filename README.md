@@ -28,6 +28,10 @@ English | [中文](README-zh.md)
 - USB devices (keyboards, mice, mass storage, etc.)
 - USB hub (optional, for multiple devices)
 
+> **One Board, Two Roles**: Flash this firmware onto your ESP32-S3 dev board and it becomes a USB/IP dongle; flash something else and it's back to being a regular dev board. No hardware modifications needed — just swap the firmware whenever you switch projects.
+
+> **USB OTG Power**: Common ESP32-S3 DevKitC boards and their compatible counterparts have a USB OTG power solder pad on the back. Bridging this pad allows the board to supply power to connected USB devices. If you prefer not to modify the hardware, you can use a self-powered USB hub (one with an external power supply) instead — the hub will power the devices while the ESP32 handles data.
+
 > **Speed Compatibility**: Ensure your ESP32 chip's USB PHY supports the USB speed type of your device. For example, High Speed UVC webcams require ESP32-P4.
 
 > **Flash Size**: Default configuration assumes ESP32-S3 (8MB flash) and ESP32-P4 (32MB flash). Modify via `idf.py menuconfig` → `Serial flasher config` → `Flash size` if needed.

@@ -28,6 +28,10 @@
 - USB 设备（键盘、鼠标、U盘等）
 - USB 集线器（可选，用于连接多个设备）
 
+> **一板两用**：只要你有一块 ESP32-S3 开发板，刷入本程序即可变身 USB/IP 转发器；想开发其他项目时只需刷入新固件即可，无需任何硬件改动。一块板子既能当 USB 转发器又能当普通开发板，非常方便。
+>
+> **USB OTG 供电**：市面常见的 ESP32-S3 DevKitC 及其兼容开发板，背面一般有一个 USB OTG 供电焊点。将此焊点短接后，开发板即可为接入的 USB 设备供电。如果不想改动硬件，可以使用支持外接供电的 USB 集线器，由集线器为设备供电，同样可以正常使用。
+>
 > **速度兼容性**：请确保 ESP32 芯片的 USB PHY 支持目标设备的 USB 速度类型。例如，High Speed 的 UVC 摄像头需要 ESP32-P4。
 
 > **Flash 大小**：默认配置为 ESP32-S3 (8MB flash) 和 ESP32-P4 (32MB flash)。如需修改，请通过 `idf.py menuconfig` → `Serial flasher config` → `Flash size` 更改。
