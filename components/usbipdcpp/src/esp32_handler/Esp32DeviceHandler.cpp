@@ -431,13 +431,18 @@ int usbipdcpp::Esp32DeviceHandler::tweak_clear_halt_cmd(const SetupPacket &setup
     auto target_endp = setup_packet.index;
     SPDLOG_DEBUG("tweak_clear_halt_cmd");
 
+    // 清 ESP32 内部 pipe 状态（HALTED → ACTIVE）
     auto err = usb_host_endpoint_clear(native_handle, target_endp);
     if (err != ESP_OK) [[unlikely]] {
         SPDLOG_ERROR("tweak_clear_halt_cmd usb_host_endpoint_clear error: {}", esp_err_to_name(err));
+        return err;
     }
-    else {
-        SPDLOG_DEBUG("tweak_clear_halt_cmd done: endp {}", target_endp);
+    // 同步发送 CLEAR_FEATURE 给设备，设备端也清除 STALL
+    err = sync_control_transfer(setup_packet);
+    if (err != ESP_OK) [[unlikely]] {
+        SPDLOG_ERROR("tweak_clear_halt_cmd sync_control_transfer error: {}", esp_err_to_name(err));
     }
+    SPDLOG_DEBUG("tweak_clear_halt_cmd done: endp {}", target_endp);
     return err; // 返回 0 表示成功，正数表示错误
 }
 
@@ -595,7 +600,6 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
             break;
         case USB_TRANSFER_STATUS_ERROR:
             SPDLOG_ERROR("transfer error on endpoint {}", trx->bEndpointAddress);
-            usb_host_endpoint_clear(callback_arg->handler->native_handle, trx->bEndpointAddress);
             break;
         case USB_TRANSFER_STATUS_CANCELED: {
             // ESP32 取消端点时会连带取消该端点所有 transfer
@@ -635,7 +639,6 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
         }
         case USB_TRANSFER_STATUS_STALL:
             SPDLOG_ERROR("endpoint {} is stalled", trx->bEndpointAddress);
-            usb_host_endpoint_clear(callback_arg->handler->native_handle, trx->bEndpointAddress);
             break;
         case USB_TRANSFER_STATUS_NO_DEVICE:
             callback_arg->handler->device_removed_ = true;
