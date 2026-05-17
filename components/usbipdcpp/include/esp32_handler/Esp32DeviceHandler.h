@@ -47,6 +47,11 @@ namespace usbipdcpp
             device_removed_ = true;
         }
 
+        void receive_urb(UsbIpCommand::UsbIpCmdSubmit cmd,
+                         UsbEndpoint ep,
+                         std::optional<UsbInterface> interface,
+                         usbipdcpp::error_code &ec) override;
+
         // ========== transfer_handle 操作覆盖实现 ==========
         void* alloc_transfer_handle(std::size_t buffer_length, int num_iso_packets, const UsbIpHeaderBasic& header, const SetupPacket& setup_packet) override;
         void* get_transfer_buffer(void* transfer_handle) override;
@@ -58,26 +63,6 @@ namespace usbipdcpp
         void free_transfer_handle(void* transfer_handle) override;
 
     protected:
-        void handle_control_urb(std::uint32_t seqnum, const UsbEndpoint& ep,
-                                std::uint32_t transfer_flags, std::uint32_t transfer_buffer_length,
-                                const SetupPacket& setup_packet, TransferHandle transfer,
-                                std::error_code& ec) override;
-        void handle_bulk_transfer(std::uint32_t seqnum, const UsbEndpoint& ep,
-                                  UsbInterface& interface, std::uint32_t transfer_flags,
-                                  std::uint32_t transfer_buffer_length, TransferHandle transfer,
-                                  std::error_code& ec) override;
-        void handle_interrupt_transfer(std::uint32_t seqnum, const UsbEndpoint& ep,
-                                       UsbInterface& interface, std::uint32_t transfer_flags,
-                                       std::uint32_t transfer_buffer_length, TransferHandle transfer,
-                                       std::error_code& ec) override;
-
-        void handle_isochronous_transfer(std::uint32_t seqnum,
-                                         const UsbEndpoint& ep, UsbInterface& interface,
-                                         std::uint32_t transfer_flags,
-                                         std::uint32_t transfer_buffer_length,
-                                         TransferHandle transfer,
-                                         int num_iso_packets,
-                                         std::error_code& ec) override;
         void cancel_all_transfer();
         void cancel_endpoint_all_transfers(uint8_t bEndpointAddress);
 

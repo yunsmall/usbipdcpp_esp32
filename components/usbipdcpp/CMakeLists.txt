@@ -36,4 +36,5 @@ target_compile_definitions(
 
 target_compile_options(${COMPONENT_LIB} PRIVATE
         -Wno-error=maybe-uninitialized
+        -Wno-missing-field-initializers
 )
