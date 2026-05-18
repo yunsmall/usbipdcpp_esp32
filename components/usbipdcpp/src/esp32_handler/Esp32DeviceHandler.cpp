@@ -48,10 +48,11 @@ void* usbipdcpp::Esp32DeviceHandler::alloc_transfer_handle(std::size_t buffer_le
     usb_transfer_t *transfer = nullptr;
     esp_err_t err = usb_host_transfer_alloc(actual_buffer_length, num_iso_packets, &transfer);
     if (err != ESP_OK) [[unlikely]] {
-        SPDLOG_ERROR("usb_host_transfer_alloc failed: {}, actual={}, free_heap={}, min_free={}, dma_free={}",
+        SPDLOG_ERROR("usb_host_transfer_alloc failed: {}, actual={}, free_heap={}, min_free={}, dma_free={}, dma_max_block={}",
                      esp_err_to_name(err), actual_buffer_length,
                      esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
-                     heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+                     heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+                     heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
         return nullptr;
     }
     return transfer;

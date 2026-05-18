@@ -269,9 +269,14 @@ int thread_main() {
     // }
     while (true) {
         std::this_thread::sleep_for(chrono::seconds(5));
-        ESP_LOGI(TAG, "Free heap: %lu, Min free heap: %lu",
+        ESP_LOGI(TAG, "Free: %lu, Min: %lu, DMA free: %lu, DMA min: %lu, PSRAM free: %lu, PSRAM min: %lu, DMA max block: %lu",
                  esp_get_free_heap_size(),
-                 esp_get_minimum_free_heap_size());
+                 esp_get_minimum_free_heap_size(),
+                 heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+                 heap_caps_get_minimum_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+                 heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                 heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM),
+                 heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
     }
 
     server.stop();
