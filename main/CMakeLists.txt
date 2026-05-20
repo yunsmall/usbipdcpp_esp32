@@ -6,6 +6,6 @@ target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-missing-field-initializers)
 #target_compile_definitions(main PRIVATE SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE)
 add_compile_definitions(
 #        SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE
-        SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_INFO
+        SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_DEBUG
         NDEBUG
 )

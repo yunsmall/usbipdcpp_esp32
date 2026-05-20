@@ -1,5 +1,6 @@
 #include "esp32_handler/Esp32DeviceHandler.h"
 
+#include <algorithm>
 #include <esp_log.h>
 
 #include "Session.h"
@@ -14,18 +15,83 @@ const char *usbipdcpp::Esp32DeviceHandler::TAG = "Esp32DeviceHandler";
 usbipdcpp::Esp32DeviceHandler::Esp32DeviceHandler(UsbDevice &handle_device, usb_device_handle_t native_handle,
                                                   usb_host_client_handle_t host_client_handle) :
     AbstDeviceHandler(handle_device), native_handle(native_handle), host_client_handle(host_client_handle) {
+    custom_transfer_io = true;
+#ifdef CONFIG_USBIPD_ENABLE_CHUNKED_TRANSFER
+    enable_chunking = CONFIG_USBIPD_ENABLE_CHUNKED_TRANSFER;
+#else
+    enable_chunking = false;
+#endif
+    enable_chunking = true;
     ESP_ERROR_CHECK(usb_host_device_info(native_handle, &device_info));
 }
 
 usbipdcpp::Esp32DeviceHandler::~Esp32DeviceHandler() = default;
 
+namespace {
+
+usbipdcpp::ChunkedTransfer* try_get_chunked(std::unordered_map<std::uint32_t, usbipdcpp::ChunkedTransfer*>& map, void* handle) {
+    for (auto& p : map) {
+        if (p.second == handle) return p.second;
+    }
+    return nullptr;
+}
+
+void log_heap_diag(const char* tag) {
+    SPDLOG_INFO("{} heap: free={}, min_free={}, dma_free={}, dma_max_block={}, psram_free={}, psram_max_block={}", tag,
+                esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
+                heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+                heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+                heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+}
+
+} // anonymous namespace
+
 // ========== transfer_handle 操作实现 ==========
 
 void* usbipdcpp::Esp32DeviceHandler::alloc_transfer_handle(std::size_t buffer_length, int num_iso_packets, const UsbIpHeaderBasic& header, const SetupPacket& setup_packet) {
-    // 计算实际需要分配的大小
-    std::size_t actual_buffer_length = buffer_length;
     bool is_control = (header.ep == 0);
     bool is_in = (header.direction == static_cast<std::uint32_t>(UsbIpDirection::In));
+
+    // 分块：启用、非控制、非等时，且超过配置的阈值
+    if (enable_chunking && !is_control && num_iso_packets == 0 && buffer_length > static_cast<std::size_t>(CONFIG_USBIPD_MAX_CHUNK_SIZE)) {
+        std::size_t chunk_size = CONFIG_USBIPD_MAX_CHUNK_SIZE;
+        std::uint16_t mps = 0;
+        if (is_in) {
+            auto it = endpoint_mps_map_.find(static_cast<std::uint8_t>(header.ep | 0x80));
+            if (it != endpoint_mps_map_.end()) mps = it->second;
+        }
+
+        auto* ct = new ChunkedTransfer();
+        std::size_t remaining = buffer_length;
+        while (remaining > 0) {
+            std::size_t alloc_size = std::min(remaining, chunk_size);
+            if (mps > 0 && alloc_size % mps != 0)
+                alloc_size = ((alloc_size + mps - 1) / mps) * mps;
+            usb_transfer_t *trx = nullptr;
+            esp_err_t err = usb_host_transfer_alloc(alloc_size, 0, &trx);
+            if (err != ESP_OK) [[unlikely]] {
+                SPDLOG_ERROR("Chunk alloc failed: {}, size={}, chunk={}/{}",
+                             esp_err_to_name(err), alloc_size,
+                             ct->transfers.size() + 1, (buffer_length + chunk_size - 1) / chunk_size);
+                log_heap_diag(TAG);
+                for (auto* t : ct->transfers) usb_host_transfer_free(t);
+                delete ct;
+                return nullptr;
+            }
+            ct->transfers.push_back(trx);
+            remaining -= std::min(remaining, chunk_size);
+        }
+        SPDLOG_INFO("CHUNKED seqnum={} ep={:02x} {} total={} chunks={} chunk_size={}",
+                    header.seqnum, header.ep, is_in ? "IN" : "OUT",
+                    buffer_length, ct->transfers.size(), chunk_size);
+        std::lock_guard lock(chunked_transfers_mutex_);
+        chunked_transfers_[header.seqnum] = ct;
+        return ct;
+    }
+
+    // 计算实际需要分配的大小
+    std::size_t actual_buffer_length = buffer_length;
 
     if (is_control) {
         // 控制传输：需要在 buffer 开头留出 setup packet 空间
@@ -48,27 +114,36 @@ void* usbipdcpp::Esp32DeviceHandler::alloc_transfer_handle(std::size_t buffer_le
     usb_transfer_t *transfer = nullptr;
     esp_err_t err = usb_host_transfer_alloc(actual_buffer_length, num_iso_packets, &transfer);
     if (err != ESP_OK) [[unlikely]] {
-        SPDLOG_ERROR("usb_host_transfer_alloc failed: {}, actual={}, free_heap={}, min_free={}, dma_free={}, dma_max_block={}",
-                     esp_err_to_name(err), actual_buffer_length,
-                     esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
-                     heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
-                     heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+        SPDLOG_ERROR("usb_host_transfer_alloc failed: {}, actual={}", esp_err_to_name(err), actual_buffer_length);
+        log_heap_diag(TAG);
         return nullptr;
     }
     return transfer;
 }
 
 void* usbipdcpp::Esp32DeviceHandler::get_transfer_buffer(void* transfer_handle) {
+    std::lock_guard lock(chunked_transfers_mutex_);
+    if (auto* ct = try_get_chunked(chunked_transfers_, transfer_handle)) {
+        return ct->transfers.empty() ? nullptr : ct->transfers[0]->data_buffer;
+    }
     auto* trx = static_cast<usb_transfer_t*>(transfer_handle);
     return trx->data_buffer;
 }
 
 std::size_t usbipdcpp::Esp32DeviceHandler::get_actual_length(void* transfer_handle) {
+    std::lock_guard lock(chunked_transfers_mutex_);
+    if (auto* ct = try_get_chunked(chunked_transfers_, transfer_handle)) {
+        return ct->total_actual_length.load();
+    }
     auto* trx = static_cast<usb_transfer_t*>(transfer_handle);
     return trx->actual_num_bytes;
 }
 
 std::size_t usbipdcpp::Esp32DeviceHandler::get_read_data_offset(void* transfer_handle) {
+    std::lock_guard lock(chunked_transfers_mutex_);
+    if (try_get_chunked(chunked_transfers_, transfer_handle)) {
+        return 0;  // 分块仅用于非控制传输，无需跳过 setup packet
+    }
     auto* trx = static_cast<usb_transfer_t*>(transfer_handle);
     // 控制传输使用端点 0（地址 0x00 或 0x80）
     if ((trx->bEndpointAddress & 0x7F) == 0) {
@@ -106,13 +181,70 @@ void usbipdcpp::Esp32DeviceHandler::set_iso_descriptor(void* transfer_handle, in
 }
 
 void usbipdcpp::Esp32DeviceHandler::free_transfer_handle(void* transfer_handle) {
+    std::lock_guard lock(chunked_transfers_mutex_);
+    if (auto* ct = try_get_chunked(chunked_transfers_, transfer_handle)) {
+        for (auto* t : ct->transfers) if (t) usb_host_transfer_free(t);
+        // 从 map 中移除（按 value 找到 key）
+        for (auto it = chunked_transfers_.begin(); it != chunked_transfers_.end(); ++it) {
+            if (it->second == ct) { chunked_transfers_.erase(it); break; }
+        }
+        delete ct;
+        return;
+    }
     usb_host_transfer_free(static_cast<usb_transfer_t*>(transfer_handle));
+}
+
+void usbipdcpp::Esp32DeviceHandler::send_transfer_data(void* handle, asio::ip::tcp::socket& sock,
+                                                        std::size_t offset, std::size_t length,
+                                                        std::error_code& ec) {
+    {
+        std::lock_guard lock(chunked_transfers_mutex_);
+        if (auto* ct = try_get_chunked(chunked_transfers_, handle)) {
+            std::size_t remaining = length;
+            for (std::size_t i = 0; i < ct->transfers.size() && remaining > 0 && !ec; i++) {
+                auto* trx = ct->transfers[i];
+                std::size_t chunk_off = (i == 0) ? offset : 0;
+                std::size_t chunk_len = std::min(remaining, static_cast<std::size_t>(trx->actual_num_bytes) - chunk_off);
+                if (chunk_len > 0) {
+                    asio::write(sock, asio::buffer(
+                        reinterpret_cast<const char*>(trx->data_buffer) + chunk_off, chunk_len), ec);
+                    remaining -= chunk_len;
+                }
+            }
+            return;
+        }
+    }
+    auto* trx = static_cast<usb_transfer_t*>(handle);
+    asio::write(sock, asio::buffer(reinterpret_cast<const char*>(trx->data_buffer) + offset, length), ec);
+}
+
+void usbipdcpp::Esp32DeviceHandler::recv_transfer_data(void* handle, asio::ip::tcp::socket& sock,
+                                                        std::size_t offset, std::size_t length,
+                                                        std::error_code& ec) {
+    {
+        std::lock_guard lock(chunked_transfers_mutex_);
+        if (auto* ct = try_get_chunked(chunked_transfers_, handle)) {
+            std::size_t remaining = length;
+            for (auto* trx : ct->transfers) {
+                if (remaining == 0) break;
+                std::size_t chunk_len = std::min(remaining, trx->data_buffer_size);
+                asio::read(sock, asio::buffer(trx->data_buffer, chunk_len), ec);
+                if (ec) return;
+                trx->num_bytes = chunk_len;
+                remaining -= chunk_len;
+            }
+            return;
+        }
+    }
+    auto* trx = static_cast<usb_transfer_t*>(handle);
+    asio::read(sock, asio::buffer(static_cast<std::uint8_t*>(trx->data_buffer) + offset, length), ec);
 }
 
 void usbipdcpp::Esp32DeviceHandler::on_new_connection(Session &current_session, error_code &ec) {
     AbstDeviceHandler::on_new_connection(current_session, ec);
     all_transfer_should_stop = false;
     device_removed_ = false;
+    log_heap_diag(TAG);
 
     // 构建端点 MPS 查找表
     endpoint_mps_map_.clear();
@@ -139,17 +271,18 @@ void usbipdcpp::Esp32DeviceHandler::on_disconnection(error_code &ec) {
         return;
     }
 
-    // 取消所有传输
-    auto transfers = transfer_tracker_.get_all_transfers();
-    for (auto &info: transfers) {
-        cancel_endpoint_all_transfers(info.endpoint);
+    // 取消所有端点的传输（遍历实际端点，不依赖 tracker 快照）
+    for (const auto &intf : handle_device.interfaces) {
+        for (const auto &ep : intf.endpoints) {
+            cancel_endpoint_all_transfers(ep.address);
+        }
     }
 
     // 等待所有传输完成
     {
         std::unique_lock lock(transfer_complete_mutex_);
         transfer_complete_cv_.wait(lock, [this]() {
-            return transfer_tracker_.concurrent_count() == 0;
+            return pending_count_ == 0 && chunked_count_ == 0;
         });
     }
 
@@ -166,36 +299,55 @@ void usbipdcpp::Esp32DeviceHandler::handle_unlink_seqnum(std::uint32_t unlink_se
             return;
     SPDLOG_INFO("handle_unlink_seqnum unlink_seqnum:{},cmd_seqnum:{}", unlink_seqnum, cmd_seqnum);
 
-    bool send_now = false;
+    bool found = false;
 
-    transfer_tracker_.with_transfer(unlink_seqnum, [&](auto *info) {
-        if (!info) {
-            // tracker 中已不存在 → 回调已完全处理完毕，可以直接发 RET_UNLINK(0)
-            send_now = true;
-            return;
+    // 分块传输：如果已有分块完成（传输已经实际开始），不 cancel，让剩余分块正常完成。
+    // 但必须设 unlinked，让回调发 ret_unlink（带实际结果）替代 ret_submit。
+    {
+        std::lock_guard lock(chunked_transfers_mutex_);
+        auto it = chunked_transfers_.find(unlink_seqnum);
+        if (it != chunked_transfers_.end()) {
+            auto* ct = it->second;
+            // 找到任意未释放的分块获取 cb（分块可能已被提前释放）
+            esp32_callback_args* cb = nullptr;
+            for (auto* t : ct->transfers) {
+                if (t) { cb = static_cast<esp32_callback_args*>(t->context); break; }
+            }
+            if (cb) {
+                cb->unlinked = true;
+                cb->unlink_cmd_seqnum = cmd_seqnum;
+                found = true;
+                if (ct->pending_count < static_cast<int>(ct->transfers.size())) {
+                    SPDLOG_INFO("handle_unlink_seqnum seqnum={}: {} chunks already done, skip cancel",
+                                unlink_seqnum, ct->transfers.size() - ct->pending_count);
+                } else {
+                    cancel_endpoint_all_transfers(ct->ep_address);
+                }
+            }
+            // cb 为空说明所有分块已释放，found 保持 false，走下方 ret_unlink(0)
         }
+    }
 
-        if (info->submit_sent || info->unlink_sent) {
-            // 回调已经发了 RET_SUBMIT 或 RET_UNLINK，现在发 RET_UNLINK(0) 不会乱序
-            send_now = true;
-            return;
+    // 非分块传输
+    if (!found) {
+        std::shared_lock lock(transfers_mutex_);
+        auto it = transfers_.find(unlink_seqnum);
+        if (it != transfers_.end()) {
+            auto* cb = it->second;
+            cb->unlinked = true;
+            cb->unlink_cmd_seqnum = cmd_seqnum;
+            found = true;
+            lock.unlock();
+            cancel_endpoint_all_transfers(static_cast<usb_transfer_t*>(cb->transfer.get())->bEndpointAddress);
         }
+    }
 
-        if (info->cancelling) {
-            // 已有另一个 unlink 正在取消此 transfer（ESP32 取消端点时会连带取消）
-            return;
-        }
-
-        // transfer 仍在 pending，标记 cancelling 并取消整个端点
-        // ESP32 不支持取消单个 transfer，只能取消整个端点
-        info->cancelling = true;
-        info->unlink_cmd_seqnum = cmd_seqnum;
-        cancel_endpoint_all_transfers(info->transfer->bEndpointAddress);
-    });
-
-    if (send_now) {
-        SPDLOG_DEBUG("transfer {} 已不在 tracker 或已发送响应，立即发送 ret_unlink {}", unlink_seqnum, cmd_seqnum);
-        session->submit_ret_unlink(
+    if (!found) {
+        // 不在任何表中——传输已完成（回调已入队 RET_SUBMIT 或 RET_UNLINK）。
+        // 此时 CMD_UNLINK 已经无关紧要，入队 RET_UNLINK(0) 但不唤醒 sender，
+        // 等待下一次 callback 的 wakeup_sender() 顺带发出，或 session 清理时发出。
+        SPDLOG_DEBUG("transfer {} 已不在传输表中，入队 ret_unlink {}", unlink_seqnum, cmd_seqnum);
+        session->enqueue_ret_unlink(
                 UsbIpResponse::UsbIpRetUnlink::create_ret_unlink(cmd_seqnum, 0));
     }
 }
@@ -233,6 +385,81 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
     }
 
     bool is_out = is_control ? setup_packet.is_out() : !ep.is_in();
+
+    // 分块传输
+    if (!is_control) {
+        bool is_chunked = false;
+        {
+            std::lock_guard lock(chunked_transfers_mutex_);
+            is_chunked = chunked_transfers_.count(seqnum) > 0;
+        }
+        if (is_chunked) {
+            auto* ct = static_cast<ChunkedTransfer*>(cmd.transfer.get());
+            ct->seqnum = seqnum;
+            ct->is_out = is_out;
+            ct->transfer_buffer_length = transfer_buffer_length;
+            ct->pending_count = ct->transfers.size();
+            ct->total_actual_length = 0;
+            ct->worst_status = USB_TRANSFER_STATUS_COMPLETED;
+            ct->ep_address = ep.address;
+            chunked_count_.fetch_add(1, std::memory_order_release);
+
+            auto* cb = callback_args_pool_.alloc();
+            if (!cb) [[unlikely]] cb = new esp32_callback_args{};
+            cb->handler = this;
+            cb->seqnum = seqnum;
+            cb->is_out = is_out;
+            cb->chunked = ct;
+            cb->transfer = std::move(cmd.transfer);
+            cb->transfer_type = (ep.attributes == static_cast<std::uint8_t>(EndpointAttributes::Bulk)) ? USB_TRANSFER_TYPE_BULK :
+                                (ep.attributes == static_cast<std::uint8_t>(EndpointAttributes::Interrupt)) ? USB_TRANSFER_TYPE_INTR :
+                                USB_TRANSFER_TYPE_BULK;
+
+            for (std::size_t i = 0; i < ct->transfers.size(); i++) {
+                auto* trx = ct->transfers[i];
+                std::uint32_t chunk_bytes = is_out ? trx->num_bytes : trx->data_buffer_size;
+                if (!is_out && ep.max_packet_size > 0) {
+                    std::uint32_t mps = ep.max_packet_size;
+                    if (chunk_bytes % mps != 0) {
+                        if (ep.attributes == static_cast<std::uint8_t>(EndpointAttributes::Bulk))
+                            chunk_bytes = ((chunk_bytes + mps - 1) / mps) * mps;
+                        else
+                            chunk_bytes = ((chunk_bytes / mps) + 1) * mps;
+                    }
+                }
+                trx->device_handle = native_handle;
+                trx->callback = chunked_transfer_callback;
+                trx->context = cb;
+                trx->bEndpointAddress = ep.address;
+                trx->num_bytes = chunk_bytes;
+                trx->flags = get_esp32_transfer_flags(transfer_flags);
+                // ZERO_PACKET 只在最后一个 OUT bulk 分块有意义，与非分块行为一致
+                if (is_out && i == ct->transfers.size() - 1 &&
+                    ep.attributes == static_cast<std::uint8_t>(EndpointAttributes::Bulk))
+                    trx->flags |= USB_TRANSFER_FLAG_ZERO_PACK;
+
+                esp_err_t err = usb_host_transfer_submit(trx);
+                if (err != ESP_OK) [[unlikely]] {
+                    SPDLOG_ERROR("Chunk submit failed: seqnum={}, err={}", seqnum, esp_err_to_name(err));
+                    // 此 chunk 未提交，不计入 pending；已提交的 chunk 会正常回调
+                    --ct->pending_count;
+                    trx->status = USB_TRANSFER_STATUS_ERROR;
+                    trx->actual_num_bytes = 0;
+                    if (static_cast<int>(USB_TRANSFER_STATUS_ERROR) > static_cast<int>(ct->worst_status))
+                        ct->worst_status = USB_TRANSFER_STATUS_ERROR;
+                }
+            }
+            // 全部提交失败时手动触发清理
+            if (ct->pending_count == 0) {
+                chunked_count_.fetch_sub(1, std::memory_order_release);
+                cb->transfer.reset(); // 触发 free_transfer_handle 清理所有 chunk 并从 map 移除
+                session->submit_ret_submit(
+                    UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum, 0));
+                if (!callback_args_pool_.free(cb)) delete cb;
+            }
+            return;
+        }
+    }
 
     // num_bytes 和 MPS 对齐
     std::uint32_t num_bytes;
@@ -314,7 +541,12 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
         return;
     }
 
-    transfer_tracker_.register_transfer(seqnum, trx, ep.address);
+    // 注册到传输表
+    {
+        std::unique_lock lock(transfers_mutex_);
+        transfers_[seqnum] = callback_args;
+        pending_count_.fetch_add(1, std::memory_order_release);
+    }
 
     LATENCY_TRACK(session->latency_tracker, seqnum,
                   "Esp32DeviceHandler::receive_urb submit");
@@ -332,7 +564,11 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
                      ep.attributes == static_cast<std::uint8_t>(EndpointAttributes::Interrupt) ? "intr" : "iso",
                      is_out ? "out" : "in",
                      esp_err_to_name(err));
-        transfer_tracker_.remove(seqnum);
+        {
+            std::unique_lock lock(transfers_mutex_);
+            transfers_.erase(seqnum);
+            pending_count_.fetch_sub(1, std::memory_order_release);
+        }
         callback_args->transfer.reset();
         if (!callback_args_pool_.free(callback_args)) {
             delete callback_args;
@@ -562,34 +798,22 @@ usb_transfer_status_t usbipdcpp::Esp32DeviceHandler::error2trxstat(int e) {
     }
 }
 
-void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
-    auto *callback_arg = static_cast<esp32_callback_args *>(trx->context);
+void usbipdcpp::Esp32DeviceHandler::chunked_transfer_callback(usb_transfer_t* trx) {
+    auto* cb = static_cast<esp32_callback_args*>(trx->context);
+    auto* ct = cb->chunked;
+    auto* handler = cb->handler;
 
-    LATENCY_TRACK(callback_arg->handler->session->latency_tracker, callback_arg->seqnum,
-                  "Esp32DeviceHandler::transfer_callback调用");
-
-    // step1: 只读取 cancelling 信息，不移除 tracker
-    bool cancelling = false;
-    std::uint32_t unlink_cmd_seqnum = 0;
-
-    callback_arg->handler->transfer_tracker_.with_transfer(callback_arg->seqnum, [&](auto *info) {
-        if (info) {
-            cancelling = info->cancelling;
-            unlink_cmd_seqnum = info->unlink_cmd_seqnum;
-        }
-    });
+    LATENCY_TRACK(handler->session->latency_tracker, cb->seqnum,
+                  "Esp32DeviceHandler::chunked_transfer_callback调用");
 
     // 如果断连了，直接清理并返回（不发送响应）
-    if (callback_arg->handler->all_transfer_should_stop) [[unlikely]] {
-        callback_arg->handler->transfer_tracker_.remove(callback_arg->seqnum);
-        if (callback_arg->handler->transfer_tracker_.concurrent_count() == 0) {
-            std::lock_guard lock(callback_arg->handler->transfer_complete_mutex_);
-            callback_arg->handler->transfer_complete_cv_.notify_one();
-        }
-        // 清理并返回
-        callback_arg->transfer.reset();
-        if (!callback_arg->handler->callback_args_pool_.free(callback_arg)) {
-            delete callback_arg;
+    if (handler->all_transfer_should_stop) [[unlikely]] {
+        bool is_last = (--ct->pending_count == 0);
+        if (is_last) {
+            handler->chunked_count_.fetch_sub(1, std::memory_order_release);
+            cb->transfer.reset(); // 触发 free_transfer_handle，清理所有 chunk 并从 map 移除
+            if (!handler->callback_args_pool_.free(cb)) delete cb;
+            handler->transfer_complete_cv_.notify_one();
         }
         return;
     }
@@ -597,142 +821,260 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
     // status 检查
     switch (trx->status) {
         case USB_TRANSFER_STATUS_COMPLETED:
-            /* OK */
+            if (trx == ct->transfers[0]) ct->transfer_started = true;
             break;
         case USB_TRANSFER_STATUS_ERROR:
-            SPDLOG_ERROR("transfer error on endpoint {}", trx->bEndpointAddress);
+            SPDLOG_ERROR("chunked transfer error on endpoint {}", trx->bEndpointAddress);
             break;
         case USB_TRANSFER_STATUS_CANCELED: {
-            // ESP32 取消端点时会连带取消该端点所有 transfer
-            // 未被标记 cancelling 的需要重新提交
-            if (!cancelling) {
-                // 取消的不是自己，重新提交自己
+            // 持有 chunked_transfers_mutex_，使判断 cb->unlinked 与重提交原子化，
+            // 防止 handle_unlink_seqnum 在判断与重提交之间设置 unlinked 并取消端点,
+            // 导致重提交的 chunk 逃过取消。
+            // transfer_started 为真表示已有数据成功传输，即使 cb->unlinked 也应重提交。
+            // STALL 触发的 cancel 不重提交
+            bool has_error = (static_cast<int>(ct->worst_status) == static_cast<int>(USB_TRANSFER_STATUS_STALL) ||
+                              static_cast<int>(ct->worst_status) == static_cast<int>(USB_TRANSFER_STATUS_NO_DEVICE));
+            std::lock_guard ck_lock(handler->chunked_transfers_mutex_);
+            if (!has_error && (!cb->unlinked || ct->transfer_started)) {
                 trx->status = USB_TRANSFER_STATUS_COMPLETED;
                 esp_err_t err;
                 {
-                    std::shared_lock lock(callback_arg->handler->endpoint_cancellation_mutex);
-                    if (callback_arg->transfer_type == USB_TRANSFER_TYPE_CTRL) {
-                        SPDLOG_TRACE("尝试重新提交控制传输");
-                        err = usb_host_transfer_submit_control(callback_arg->handler->host_client_handle, trx);
-                    }
-                    else {
-                        SPDLOG_TRACE("尝试重新提交非控制传输");
-                        err = usb_host_transfer_submit(trx);
-                    }
+                    std::shared_lock ep_lock(handler->endpoint_cancellation_mutex);
+                    err = usb_host_transfer_submit(trx);
                 }
                 if (err != ESP_OK) {
-                    SPDLOG_ERROR("seqnum为{}的传输重新提交失败：{}", callback_arg->seqnum, esp_err_to_name(err));
-                    // 重新提交失败，需要从 tracker 移除
-                    callback_arg->handler->transfer_tracker_.remove(callback_arg->seqnum);
-                    callback_arg->handler->session->submit_ret_submit(
-                            UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(
-                                    callback_arg->seqnum, 0));
-                    callback_arg->transfer.reset();
-                    if (!callback_arg->handler->callback_args_pool_.free(callback_arg)) {
-                        delete callback_arg;
-                    }
+                    SPDLOG_ERROR("chunked seqnum为{}的传输重新提交失败：{}", cb->seqnum, esp_err_to_name(err));
+                    trx->status = USB_TRANSFER_STATUS_ERROR;
+                    trx->actual_num_bytes = 0;
+                } else {
+                    return;
                 }
-                // 重新提交成功，传输仍在 tracker 中，直接返回
-                return;
+            } else {
+                auto chunk_idx = std::find(ct->transfers.begin(), ct->transfers.end(), trx) - ct->transfers.begin();
+                SPDLOG_INFO("chunk {}/{} seqnum {} canceled on endpoint {}",
+                            chunk_idx + 1, ct->transfers.size(), cb->seqnum, trx->bEndpointAddress);
             }
-            SPDLOG_INFO("transfer seqnum {} canceled on endpoint {}",callback_arg->seqnum, trx->bEndpointAddress);
             break;
         }
         case USB_TRANSFER_STATUS_STALL:
-            SPDLOG_ERROR("endpoint {} is stalled", trx->bEndpointAddress);
+            SPDLOG_ERROR("chunked endpoint {} is stalled", trx->bEndpointAddress);
+            handler->cancel_endpoint_all_transfers(trx->bEndpointAddress);
             break;
         case USB_TRANSFER_STATUS_NO_DEVICE:
-            callback_arg->handler->device_removed_ = true;
-            SPDLOG_INFO("device removed?");
+            handler->device_removed_ = true;
+            SPDLOG_INFO("chunked device removed?");
             break;
         default:
-            SPDLOG_WARN("urb completion with unknown status {}", static_cast<int>(trx->status));
+            SPDLOG_WARN("chunked urb completion with unknown status {}", static_cast<int>(trx->status));
             break;
+    }
+    auto chunk_idx = std::find(ct->transfers.begin(), ct->transfers.end(), trx) - ct->transfers.begin();
+    SPDLOG_DEBUG("chunk {}/{} seqnum {} done, status={}, {} bytes",
+                 chunk_idx + 1, ct->transfers.size(), cb->seqnum,
+                 static_cast<int>(trx->status), trx->actual_num_bytes);
+
+    // 跟踪最差状态和实际长度
+    if (static_cast<int>(trx->status) > static_cast<int>(ct->worst_status))
+        ct->worst_status = trx->status;
+    // 累加实际传输字节数（IN 和 OUT 都需要）
+    ct->total_actual_length += trx->actual_num_bytes;
+
+    // OUT 分块数据已发给设备，立即释放 transfer 减少 DMA 内存压力
+    if (cb->is_out) {
+        ct->transfers[chunk_idx] = nullptr;
+        usb_host_transfer_free(trx);
+    }
+
+    if (--ct->pending_count > 0) return;  // 还有未完成的 chunk
+
+    // ========== 所有 chunk 完成 ==========
+    auto seqnum = ct->seqnum;
+    auto worst = ct->worst_status;
+    bool is_out = ct->is_out;
+
+    // 计算 actual_length：成功传输的字节数
+    std::uint32_t actual_length = static_cast<std::uint32_t>(ct->total_actual_length.load());
+
+    // 在锁内检查 unlinked、入队响应——原子完成。
+    // map 由 free_transfer_handle 统一擦除，不在此处擦，避免 free_transfer_handle
+    // 查找不到 ct 而将 ChunkedTransfer* 误当 usb_transfer_t* 释放。
+    bool need_reset_transfer = false;
+    {
+        std::lock_guard lock(handler->chunked_transfers_mutex_);
+        if (cb->unlinked) {
+            SPDLOG_INFO("CHUNKED DONE seqnum={} {} UNLINK unlink_cmd={} worst_status={} actual_length={}",
+                        seqnum, is_out ? "OUT" : "IN", cb->unlink_cmd_seqnum,
+                        static_cast<int>(worst), actual_length);
+            LATENCY_TRACK_END_MSG(handler->session->latency_tracker, cb->unlink_cmd_seqnum, "被unlink");
+            handler->session->enqueue_ret_unlink(
+                UsbIpResponse::UsbIpRetUnlink::create_ret_unlink(
+                    cb->unlink_cmd_seqnum, handler->trxstat2error(worst)));
+            need_reset_transfer = true;
+        } else {
+            UsbIpResponse::UsbIpRetSubmit ret;
+            if (is_out) {
+                ret = UsbIpResponse::UsbIpRetSubmit::create_ret_submit_with_status_and_no_data(
+                    seqnum, handler->trxstat2error(worst), actual_length);
+                need_reset_transfer = true;
+            } else {
+                ret = UsbIpResponse::UsbIpRetSubmit::create_ret_submit(
+                    seqnum, handler->trxstat2error(worst),
+                    actual_length, 0, 0, std::move(cb->transfer));
+            }
+            SPDLOG_INFO("CHUNKED DONE seqnum={} {} RET_SUBMIT status={} actual_length={}",
+                        seqnum, is_out ? "OUT" : "IN",
+                        handler->trxstat2error(worst), actual_length);
+            LATENCY_TRACK(handler->session->latency_tracker, seqnum,
+                          "Esp32DeviceHandler::chunked_transfer_callback submit_ret_submit");
+            handler->session->enqueue_ret_submit(std::move(ret));
+        }
+        handler->chunked_count_.fetch_sub(1, std::memory_order_release);
+    }
+    // 在锁外 reset，避免 free_transfer_handle 内拿 chunked_transfers_mutex_ 死锁
+    if (need_reset_transfer) {
+        cb->transfer.reset();
+    }
+    handler->session->wakeup_sender();
+
+    if (!handler->callback_args_pool_.free(cb)) delete cb;
+
+    // 无条件通知，覆盖正常路径与 on_disconnection 的竞态。
+    // CV 谓词确保只有最后一个 callback 真正唤醒 wait。
+    handler->transfer_complete_cv_.notify_one();
+}
+
+void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
+    auto *cb = static_cast<esp32_callback_args *>(trx->context);
+    auto *handler = cb->handler;
+
+    LATENCY_TRACK(handler->session->latency_tracker, cb->seqnum,
+                  "Esp32DeviceHandler::transfer_callback调用");
+
+    // 如果断连了，直接清理并返回（不发送响应）
+    if (handler->all_transfer_should_stop) [[unlikely]] {
+        {
+            std::unique_lock lock(handler->transfers_mutex_);
+            handler->transfers_.erase(cb->seqnum);
+            handler->pending_count_.fetch_sub(1, std::memory_order_release);
+        }
+        cb->transfer.reset();
+        if (!handler->callback_args_pool_.free(cb)) delete cb;
+        // 无条件通知，覆盖与 on_disconnection 的竞态。
+        // CV 谓词确保只有最后一个 callback 真正唤醒 wait。
+        handler->transfer_complete_cv_.notify_one();
+        return;
+    }
+
+    // 持有 transfers_mutex_ 进行 CANCELED 判断，使判断与重提交之间原子化，
+    // 防止 handle_unlink_seqnum 在判断与重提交之间设置 unlinked 并取消端点。
+    {
+        std::unique_lock lock(handler->transfers_mutex_);
+
+        // status 检查
+        switch (trx->status) {
+            case USB_TRANSFER_STATUS_COMPLETED:
+                break;
+            case USB_TRANSFER_STATUS_ERROR:
+                SPDLOG_ERROR("transfer error on endpoint {}", trx->bEndpointAddress);
+                break;
+            case USB_TRANSFER_STATUS_CANCELED: {
+                // ESP32 取消端点时会连带取消该端点所有 transfer
+                // 未被标记 unlinked 的需要重新提交（持有 transfers_mutex_，与 handle_unlink_seqnum 互斥）
+                if (!cb->unlinked) {
+                    trx->status = USB_TRANSFER_STATUS_COMPLETED;
+                    esp_err_t err;
+                    {
+                        std::shared_lock ep_lock(handler->endpoint_cancellation_mutex);
+                        if (cb->transfer_type == USB_TRANSFER_TYPE_CTRL) {
+                            err = usb_host_transfer_submit_control(handler->host_client_handle, trx);
+                        } else {
+                            err = usb_host_transfer_submit(trx);
+                        }
+                    }
+                    if (err != ESP_OK) {
+                        SPDLOG_ERROR("seqnum为{}的传输重新提交失败：{}", cb->seqnum, esp_err_to_name(err));
+                        handler->transfers_.erase(cb->seqnum);
+                        handler->pending_count_.fetch_sub(1, std::memory_order_release);
+                        lock.unlock();
+                        handler->session->submit_ret_submit(
+                            UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(cb->seqnum, 0));
+                        cb->transfer.reset();
+                        if (!handler->callback_args_pool_.free(cb)) delete cb;
+                    }
+                    return;
+                }
+                SPDLOG_INFO("transfer seqnum {} canceled on endpoint {}", cb->seqnum, trx->bEndpointAddress);
+                break;
+            }
+            case USB_TRANSFER_STATUS_STALL:
+                SPDLOG_ERROR("endpoint {} is stalled", trx->bEndpointAddress);
+                break;
+            case USB_TRANSFER_STATUS_NO_DEVICE:
+                handler->device_removed_ = true;
+                SPDLOG_INFO("device removed?");
+                break;
+            default:
+                SPDLOG_WARN("urb completion with unknown status {}", static_cast<int>(trx->status));
+                break;
+        }
     }
     SPDLOG_DEBUG("esp32传输了{}个字节", trx->actual_num_bytes);
 
     // 计算 actual_length
     std::uint32_t actual_length = trx->actual_num_bytes;
-
-    // 控制传输 IN：减去 setup packet 大小
     bool is_control = (trx->bEndpointAddress & 0x7F) == 0;
-    if (!callback_arg->is_out && is_control) {
+    if (!cb->is_out && is_control) {
         if (actual_length > USB_SETUP_PACKET_SIZE)
             actual_length -= USB_SETUP_PACKET_SIZE;
         else
             actual_length = 0;
     }
-    // ISO 传输：计算所有 iso packet 的 actual_length 之和
-    if (trx->num_isoc_packets > 0 && !callback_arg->is_out) {
+    if (trx->num_isoc_packets > 0 && !cb->is_out) {
         std::uint32_t iso_actual = 0;
         for (int i = 0; i < trx->num_isoc_packets; i++)
             iso_actual += trx->isoc_packet_desc[i].actual_num_bytes;
         actual_length = iso_actual;
     }
 
-    if (!cancelling) [[likely]] {
-        // step2: 发送 ret_submit
-        UsbIpResponse::UsbIpRetSubmit ret;
-        if (callback_arg->is_out) {
-            // OUT 传输：无数据阶段
-            ret = UsbIpResponse::UsbIpRetSubmit::create_ret_submit_with_status_and_no_data(
-                    callback_arg->seqnum, trxstat2error(trx->status), actual_length);
-            // OUT 传输：释放 transfer
-            callback_arg->transfer.reset();
-        }
-        else {
-            // IN 传输：有数据，转移所有权
-            ret = UsbIpResponse::UsbIpRetSubmit::create_ret_submit(
-                    callback_arg->seqnum, trxstat2error(trx->status),
-                    actual_length, 0, trx->num_isoc_packets,
-                    std::move(callback_arg->transfer));
-        }
-        SPDLOG_DEBUG("esp32传输actual_length为{}个字节", actual_length);
-        LATENCY_TRACK(callback_arg->handler->session->latency_tracker, callback_arg->seqnum,
-                      "Esp32DeviceHandler::transfer_callback submit_ret_submit");
-        callback_arg->handler->session->submit_ret_submit(std::move(ret));
+    // 在锁内检查 unlinked、入队响应、移除追踪——原子完成。
+    // handle_unlink_seqnum 若在此之前执行，会看到 map 中有此 entry 并设置 unlinked；
+    // 若在此之后，则看不到，自行入队 RET_UNLINK(0)。
+    {
+        std::unique_lock lock(handler->transfers_mutex_);
+        bool unlinked = cb->unlinked;
+        std::uint32_t unlink_cmd_seqnum = cb->unlink_cmd_seqnum;
+        handler->transfers_.erase(cb->seqnum);
+        handler->pending_count_.fetch_sub(1, std::memory_order_release);
 
-        // step3: 标记 submit_sent，二次检查 cancelling，补发 RET_UNLINK(0)
-        bool need_defer_unlink = false;
-        std::uint32_t defer_unlink_cmd = 0;
-        callback_arg->handler->transfer_tracker_.with_transfer(callback_arg->seqnum, [&](auto *info) {
-            if (info) {
-                info->submit_sent = true;
-                if (info->cancelling && !info->unlink_sent) {
-                    need_defer_unlink = true;
-                    defer_unlink_cmd = info->unlink_cmd_seqnum;
-                    info->unlink_sent = true;
-                }
-            }
-        });
-        if (need_defer_unlink) {
-            SPDLOG_DEBUG("transfer {} 在 submit 后检测到 cancelling，补发 ret_unlink {}",
-                         callback_arg->seqnum, defer_unlink_cmd);
-            callback_arg->handler->session->submit_ret_unlink(
-                    UsbIpResponse::UsbIpRetUnlink::create_ret_unlink(defer_unlink_cmd, 0));
-        }
-    }
-    else {
-        // unlink 情况：发送 ret_unlink
-        LATENCY_TRACK_END_MSG(callback_arg->handler->session->latency_tracker, unlink_cmd_seqnum, "被unlink");
-        callback_arg->handler->session->submit_ret_unlink(
+        if (unlinked) {
+            LATENCY_TRACK_END_MSG(handler->session->latency_tracker, unlink_cmd_seqnum, "被unlink");
+            handler->session->enqueue_ret_unlink(
                 UsbIpResponse::UsbIpRetUnlink::create_ret_unlink(
-                        unlink_cmd_seqnum, trxstat2error(trx->status)));
-        callback_arg->transfer.reset();
-
-        // 标记 unlink_sent
-        callback_arg->handler->transfer_tracker_.with_transfer(callback_arg->seqnum, [&](auto *info) {
-            if (info) info->unlink_sent = true;
-        });
+                    unlink_cmd_seqnum, trxstat2error(trx->status)));
+            cb->transfer.reset();
+        } else {
+            UsbIpResponse::UsbIpRetSubmit ret;
+            if (cb->is_out) {
+                ret = UsbIpResponse::UsbIpRetSubmit::create_ret_submit_with_status_and_no_data(
+                    cb->seqnum, trxstat2error(trx->status), actual_length);
+                cb->transfer.reset();
+            } else {
+                ret = UsbIpResponse::UsbIpRetSubmit::create_ret_submit(
+                    cb->seqnum, trxstat2error(trx->status),
+                    actual_length, 0, trx->num_isoc_packets,
+                    std::move(cb->transfer));
+            }
+            SPDLOG_DEBUG("esp32传输actual_length为{}个字节", actual_length);
+            LATENCY_TRACK(handler->session->latency_tracker, cb->seqnum,
+                          "Esp32DeviceHandler::transfer_callback submit_ret_submit");
+            handler->session->enqueue_ret_submit(std::move(ret));
+        }
     }
+    handler->session->wakeup_sender();
 
-    // step4: submit_sent 或 unlink_sent 为真时移除 tracker
-    callback_arg->handler->transfer_tracker_.check_and_remove(callback_arg->seqnum, [&](auto *info) {
-        if (!info) return false;
-        return info->submit_sent || info->unlink_sent;
-    });
+    if (!handler->callback_args_pool_.free(cb)) delete cb;
 
-    if (!callback_arg->handler->callback_args_pool_.free(callback_arg)) {
-        delete callback_arg;
-    }
+    // 无条件通知，覆盖正常路径与 on_disconnection 的竞态。
+    // CV 谓词确保只有最后一个 callback 真正唤醒 wait。
+    handler->transfer_complete_cv_.notify_one();
 }
