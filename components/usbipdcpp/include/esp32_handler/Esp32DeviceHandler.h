@@ -41,6 +41,11 @@ struct ChunkedTransfer {
     std::atomic<bool> transfer_started{false};
     // 端点地址，避免 transfers[0] 被提前释放后无法访问
     std::uint8_t ep_address = 0;
+    // IN：PSRAM 累积缓冲区，每个分块完成后将设备返回数据拷入对应位置，
+    // 使 DMA transfer 可以立即释放，ret_submit 时从此缓冲区发送
+    uint8_t* in_data = nullptr;
+    // IN 累积缓冲区的总大小（= 原始 transfer_buffer_length）
+    std::size_t in_data_size = 0;
 };
 
     class Esp32DeviceHandler : public AbstDeviceHandler
@@ -154,6 +159,10 @@ struct ChunkedTransfer {
         std::unordered_map<std::uint32_t, ChunkedTransfer*> chunked_transfers_;
         std::atomic<int> chunked_count_{0};
 
+        // ChunkedTransfer 对象池，避免频繁 new/delete
+        using ChunkedPool = ObjectPool<ChunkedTransfer, 16, true>;
+        ChunkedPool chunked_pool_;
+
         static const char* TAG;
 
         usb_device_handle_t native_handle;
@@ -165,6 +174,7 @@ struct ChunkedTransfer {
         std::atomic_bool device_removed_ = false;
 
         bool enable_chunking = true;
+        std::size_t chunk_size_ = 4096;
 
         // 端点 MPS 查找表：端点地址 -> max_packet_size
         std::unordered_map<std::uint8_t, std::uint16_t> endpoint_mps_map_;
