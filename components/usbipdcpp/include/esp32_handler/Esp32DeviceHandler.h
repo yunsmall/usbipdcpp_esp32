@@ -3,6 +3,8 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <queue>
+#include <set>
 #include <shared_mutex>
 #include <unordered_map>
 #include <vector>
@@ -46,6 +48,13 @@ struct ChunkedTransfer {
     uint8_t* in_data = nullptr;
     // IN 累积缓冲区的总大小（= 原始 transfer_buffer_length）
     std::size_t in_data_size = 0;
+    // IN：设备在某分块返回短包/ZLP 后置 true。
+    // CANCELED 回调据此跳过重提交（设备已结束，重提交只会继续 NAK）
+    std::atomic<bool> in_short{false};
+    // 下一个待提交的分块索引，每次仅提交一个，完成后回调里递进
+    int current_chunk = 0;
+    // 原始 CMD_SUBMIT 的 transfer_flags，回调提交后续分块时计算 ZLP 位
+    std::uint32_t transfer_flags = 0;
 };
 
     class Esp32DeviceHandler : public AbstDeviceHandler
@@ -88,9 +97,9 @@ struct ChunkedTransfer {
         void free_transfer_handle(void* transfer_handle) override;
 
         void send_transfer_data(void* handle, asio::ip::tcp::socket& sock,
-                                std::size_t offset, std::size_t length, std::error_code& ec) override;
+                                std::size_t length, std::error_code& ec) override;
         void recv_transfer_data(void* handle, asio::ip::tcp::socket& sock,
-                                std::size_t offset, std::size_t length, std::error_code& ec) override;
+                                std::size_t length, std::error_code& ec) override;
 
     protected:
         void cancel_all_transfer();
@@ -136,6 +145,19 @@ struct ChunkedTransfer {
             std::uint32_t unlink_cmd_seqnum = 0;
             std::uint32_t original_transfer_buffer_length = 0;
             TransferHandle transfer;  // 拥有 transfer 的所有权
+
+            void reset()
+            {
+                handler = nullptr;
+                seqnum = 0;
+                transfer_type = static_cast<usb_transfer_type_t>(0);
+                is_out = false;
+                chunked = nullptr;
+                unlinked = false;
+                unlink_cmd_seqnum = 0;
+                original_transfer_buffer_length = 0;
+                transfer.reset();
+            }
         };
 
         static void transfer_callback(usb_transfer_t* trx);
@@ -150,7 +172,7 @@ struct ChunkedTransfer {
         std::condition_variable transfer_complete_cv_;
 
         // 非分块传输表：seqnum → callback_args*（参考 libusb 模型）
-        std::shared_mutex transfers_mutex_;
+        std::mutex transfers_mutex_;
         std::unordered_map<std::uint32_t, esp32_callback_args*> transfers_;
         std::atomic<std::size_t> pending_count_{0};
 
@@ -162,6 +184,24 @@ struct ChunkedTransfer {
         // ChunkedTransfer 对象池，避免频繁 new/delete
         using ChunkedPool = ObjectPool<ChunkedTransfer, 16, true>;
         ChunkedPool chunked_pool_;
+
+        // 同端点串行化：端点有分块传输正在处理时，新来的传输入队等待
+        // 避免一次性提交多个分块阻塞 pipe，也防止多个传输交织打乱顺序
+        struct DeferredUrb {
+            UsbIpCommand::UsbIpCmdSubmit cmd;
+            UsbEndpoint ep;
+            std::optional<UsbInterface> interface;
+        };
+        std::mutex deferred_urbs_mutex_;
+        std::unordered_map<uint8_t, std::queue<DeferredUrb>> deferred_urbs_;
+        // 同端点分块传输进行中标记，防止多个分块传输同时占用同一 pipe
+        std::mutex active_chunked_eps_mutex_;
+        std::set<uint8_t> active_chunked_eps_;
+        // 提交分块传输的第一个 chunk（从 receive_urb 或 deferred 出队后调用）
+        void submit_first_chunk(ChunkedTransfer* ct, esp32_callback_args* cb,
+                                const UsbEndpoint& ep, std::uint32_t transfer_flags);
+        // 出队并处理指定端点的下一个 pending transfer
+        void process_pending_urb(uint8_t ep_addr);
 
         static const char* TAG;
 

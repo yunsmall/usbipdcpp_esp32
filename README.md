@@ -158,6 +158,22 @@ If you use this project in a product, please display the following information p
 - Author: `yunsmall` (GitHub)
 - Contact: `yun_small@163.com`
 
+## ⚠️ Known Issues
+
+### Chunked Transfer — Currently Disabled
+
+Large USB transfers (e.g. 65536 bytes for firmware flashing) require a single DMA-capable buffer of the same size. When DMA memory is fragmented, a large contiguous allocation can fail even though the total free space is sufficient.
+
+**Chunked transfer** addresses this by splitting the large allocation into multiple smaller blocks (default: 16384 bytes each), trading one large contiguous allocation for several smaller ones — dramatically increasing the probability of successful allocation.
+
+However, chunking is **disabled by default** (`enable_chunking = false` in `Esp32DeviceHandler.cpp`) due to a persistent timeout issue: when enabled, some bulk transfer scenarios (e.g. remote JLINK firmware flashing) cause the first chunk to NAK indefinitely while waiting for device data. The host times out after ~1 second, sends CMD_UNLINK, and the cycle repeats. The root cause has not been fully identified.
+
+If you know how to fix this, pull requests are welcome.
+
+### Hardware Recommendation
+
+**ESP32-P4 is strongly recommended** over ESP32-S3 for USB/IP use. ESP32-S3's internal DMA-capable memory is very limited (~300KB), which can cause large USB transfer buffer allocations to fail under load. ESP32-P4 supports DMA access to PSRAM, which removes the need for chunking in most cases.
+
 ## 📄 License
 
 Apache License 2.0
