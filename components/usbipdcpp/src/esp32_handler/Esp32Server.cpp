@@ -1,6 +1,6 @@
 #include "esp32_handler/Esp32Server.h"
 
-#include <Session.h>
+#include <usbipdcpp/Session.h>
 #include <usb/usb_helpers.h>
 #include <esp_log.h>
 
@@ -117,6 +117,13 @@ void usbipdcpp::Esp32Server::bind_host_device(usb_device_handle_t dev) {
         err = usb_host_interface_claim(host_client_handle, dev, intf_i, 0);
         if (err != ESP_OK) {
             SPDLOG_ERROR("无法声明接口{}：{}", intf_i, esp_err_to_name(err));
+            // 回滚之前已成功声明的接口，否则它们会被永久占用
+            for (auto claimed_i = 0; claimed_i < intf_i; claimed_i++) {
+                auto rel_ret = usb_host_interface_release(host_client_handle, dev, claimed_i);
+                if (rel_ret != ESP_OK) {
+                    SPDLOG_ERROR("回滚释放接口{}失败: {}", claimed_i, esp_err_to_name(rel_ret));
+                }
+            }
             return;
         }
 
@@ -135,10 +142,11 @@ void usbipdcpp::Esp32Server::bind_host_device(usb_device_handle_t dev) {
         }
         interfaces.emplace_back(
                 UsbInterface{
-                        intf_desc->bInterfaceClass,
-                        intf_desc->bInterfaceSubClass,
-                        intf_desc->bInterfaceProtocol,
-                        std::move(endpoints)
+                        .interface_class = intf_desc->bInterfaceClass,
+                        .interface_subclass = intf_desc->bInterfaceSubClass,
+                        .interface_protocol = intf_desc->bInterfaceProtocol,
+                        // endpoints 按 altsetting 分组，这里只使用第一个 altsetting（alt 0）
+                        .endpoints = {std::move(endpoints)}
                 }
                 //直接全用libusb控制，不用走端口
                 // .with_handler<LibusbInterfaceHandler>()

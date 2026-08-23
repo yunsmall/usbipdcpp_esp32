@@ -13,3 +13,4 @@ compile_commands.json
 CMakeUserPresets.json
 CLAUDE.md
 sdkconfig.defaults
+/tmp

@@ -8,7 +8,6 @@ set(USBIPDCPP_ORIGIN_SRC_FILES
         ${USBIPDCPP_BASE_SRC_FILES}
         ${USBIPDCPP_DEVICE_HANDLER_SRC_FILES}
         ${USBIPDCPP_INTERFACE_HANDLER_SRC_FILES}
-        ${usbipdcpp_DIR}/examples/mock_mouse/mock_mouse.cpp
 )
 
 file(GLOB USBIPDCPP_ESP32_HANDLER_SRC_FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/esp32_handler/*.cpp)
@@ -16,7 +15,7 @@ file(GLOB USBIPDCPP_ESP32_HANDLER_SRC_FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/esp3
 set(USBIPDCPP_ALL_SRC_FILES ${USBIPDCPP_ORIGIN_SRC_FILES} ${USBIPDCPP_ESP32_HANDLER_SRC_FILES})
 
 idf_component_register(SRCS ${USBIPDCPP_ALL_SRC_FILES}
-        INCLUDE_DIRS ${usbipdcpp_DIR}/include ${usbipdcpp_DIR}/examples/mock_mouse include
+        INCLUDE_DIRS ${usbipdcpp_DIR}/include include
         REQUIRES asio lwip sock_utils spdlog usb pthread)
 
 math(EXPR USBIPDCPP_MAX_TRANSFER_BUFFER_SIZE "2*1024*1024")
@@ -25,6 +24,8 @@ target_compile_definitions(
         ${COMPONENT_LIB} PRIVATE
         NDEBUG
         USBIPDCPP_MAX_TRANSFER_BUFFER_SIZE=${USBIPDCPP_MAX_TRANSFER_BUFFER_SIZE}
+        # ESP-IDF 的 libc 只有 std::signal 声明没有实现，链接失败，跳过
+        USBIPDCPP_DISABLE_SIGNAL
 )
 
 # usbipdcpp 库文件日志级别

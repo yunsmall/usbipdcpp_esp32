@@ -8,7 +8,7 @@
 #include <asio.hpp>
 
 
-#include "Server.h"
+#include "usbipdcpp/Server.h"
 
 namespace usbipdcpp
 {
