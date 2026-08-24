@@ -166,6 +166,13 @@ Large USB transfers (e.g. 65536 bytes for firmware flashing) require a single DM
 
 **Chunked transfer** addresses this by splitting the large allocation into multiple smaller blocks (default: 16384 bytes each), trading one large contiguous allocation for several smaller ones — dramatically increasing the probability of successful allocation.
 
+The chunked transfer implementation has been moved to the `feature/chunked-transfer` branch. To try it out, switch to that branch and build:
+
+```bash
+git checkout feature/chunked-transfer
+idf.py build flash monitor
+```
+
 However, chunking is **disabled by default** (`enable_chunking = false` in `Esp32DeviceHandler.cpp`) due to a persistent timeout issue: when enabled, some bulk transfer scenarios (e.g. remote JLINK firmware flashing) cause the first chunk to NAK indefinitely while waiting for device data. The host times out after ~1 second, sends CMD_UNLINK, and the cycle repeats. The root cause has not been fully identified.
 
 If you know how to fix this, pull requests are welcome.

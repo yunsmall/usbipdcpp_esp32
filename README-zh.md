@@ -166,6 +166,13 @@ sudo usbip attach -r <ESP32_IP> -b <BUSID>
 
 **分块传输**将大块分配拆成多个小块（默认 16384 字节），用几个小块分配替代一个大块分配，大幅提高分配成功率。
 
+分块实现已移至 `feature/chunked-transfer` 分支。想体验分块传输的，请切换分支后编译：
+
+```bash
+git checkout feature/chunked-transfer
+idf.py build flash monitor
+```
+
 但分块传输当前**默认禁用**（`Esp32DeviceHandler.cpp` 中 `enable_chunking = false`）。启用后，部分批量传输场景（如远程 JLINK 固件烧写）会反复超时——第一个分块因等待设备数据而 NAK，host 约 1 秒后超时发送 CMD_UNLINK，传输失败后 host 重试，循环往复。根因尚未完全定位。
 
 欢迎提交 PR 修复。
