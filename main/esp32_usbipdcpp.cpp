@@ -259,7 +259,7 @@ int thread_main() {
     auto ec = server.start(endpoint);
     if (ec) [[unlikely]] {
         ESP_LOGE(TAG, "服务器启动失败：{}", ec.message());
-        return;
+        return -1;
     }
 
     // SPDLOG_INFO("Start turning over left button");

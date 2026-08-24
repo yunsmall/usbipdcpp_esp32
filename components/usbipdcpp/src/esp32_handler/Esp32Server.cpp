@@ -71,9 +71,16 @@ void usbipdcpp::Esp32Server::client_event_callback(const usb_host_client_event_m
         if (err == ESP_OK) {
             spdlog::info("尝试释放{}的所有接口", static_cast<void *>(event_msg->dev_gone.dev_hdl));
             for (int intf_i = 0; intf_i < active_config_desc->bNumInterfaces; intf_i++) {
-                err = usb_host_interface_release(this_server->host_client_handle, event_msg->dev_gone.dev_hdl, intf_i);
+                int intf_offset;
+                auto intf_desc = usb_parse_interface_descriptor(active_config_desc, intf_i, 0, &intf_offset);
+                if (!intf_desc)
+                    continue;
+                // release 的第三参数是 bInterfaceNumber（接口号），
+                // 跳号接口用数组下标会释放错误的接口
+                err = usb_host_interface_release(this_server->host_client_handle, event_msg->dev_gone.dev_hdl,
+                                                 intf_desc->bInterfaceNumber);
                 if (err != ESP_OK) {
-                    SPDLOG_ERROR("释放设备接口时出错: {}", esp_err_to_name(err));
+                    SPDLOG_ERROR("释放设备接口{}时出错: {}", intf_desc->bInterfaceNumber, esp_err_to_name(err));
                 }
             }
 
@@ -128,15 +135,24 @@ esp_err_t usbipdcpp::Esp32Server::bind_host_device(usb_device_handle_t dev) {
 
         int intf_offset;
         auto intf_desc = usb_parse_interface_descriptor(active_config_desc, intf_i, 0, &intf_offset);
+        if (!intf_desc)
+            continue;
         //只使用第一个alsetting
-        err = usb_host_interface_claim(host_client_handle, dev, intf_i, 0);
+        // claim 的第三参数是 bInterfaceNumber（接口号）而非数组下标：
+        // usbh 内部按 intf_desc->bInterfaceNumber 匹配接口对象（usbh.c 的
+        // interface_claim），跳号接口（如只有 0 和 2）用下标会指向不存在的接口
+        err = usb_host_interface_claim(host_client_handle, dev, intf_desc->bInterfaceNumber, 0);
         if (err != ESP_OK) {
-            SPDLOG_ERROR("无法声明接口{}：{}", intf_i, esp_err_to_name(err));
+            SPDLOG_ERROR("无法声明接口{}：{}", intf_desc->bInterfaceNumber, esp_err_to_name(err));
             // 回滚之前已成功声明的接口，否则它们会被永久占用
             for (auto claimed_i = 0; claimed_i < intf_i; claimed_i++) {
-                auto rel_ret = usb_host_interface_release(host_client_handle, dev, claimed_i);
+                int claimed_offset;
+                auto claimed_intf = usb_parse_interface_descriptor(active_config_desc, claimed_i, 0, &claimed_offset);
+                if (!claimed_intf)
+                    continue;
+                auto rel_ret = usb_host_interface_release(host_client_handle, dev, claimed_intf->bInterfaceNumber);
                 if (rel_ret != ESP_OK) {
-                    SPDLOG_ERROR("回滚释放接口{}失败: {}", claimed_i, esp_err_to_name(rel_ret));
+                    SPDLOG_ERROR("回滚释放接口{}失败: {}", claimed_intf->bInterfaceNumber, esp_err_to_name(rel_ret));
                 }
             }
             usb_host_device_close(host_client_handle, dev);
@@ -225,9 +241,15 @@ void usbipdcpp::Esp32Server::unbind_host_device(usb_device_handle_t dev) {
                         return;
                     }
                     for (int intf_i = 0; intf_i < active_config_desc->bNumInterfaces; intf_i++) {
-                        err = usb_host_interface_release(host_client_handle, dev, intf_i);
+                        int intf_offset;
+                        auto intf_desc = usb_parse_interface_descriptor(active_config_desc, intf_i, 0, &intf_offset);
+                        if (!intf_desc)
+                            continue;
+                        // release 的第三参数是 bInterfaceNumber（接口号），
+                        // 跳号接口用数组下标会释放错误的接口
+                        err = usb_host_interface_release(host_client_handle, dev, intf_desc->bInterfaceNumber);
                         if (err != ESP_OK) {
-                            SPDLOG_ERROR("释放设备接口时出错: {}", esp_err_to_name(err));
+                            SPDLOG_ERROR("释放接口{}时出错: {}", intf_desc->bInterfaceNumber, esp_err_to_name(err));
                         }
                     }
                 }
@@ -316,9 +338,11 @@ usbipdcpp::error_code usbipdcpp::Esp32Server::start(asio::ip::tcp::endpoint &ep)
             // 线程创建失败（资源不足）：start 承诺不抛异常，错误通过返回值
             // 报告（与 LibusbServer::start 一致）。调用方按失败处理不再调
             // stop()，这里必须回滚已启动的 server，否则监听端口泄漏。
-            // 锁由 RAII 释放；pthread 配置残留无影响（before/after 回调会
-            // 为后续线程重新设置）
+            // 锁由 RAII 释放；恢复全局 pthread 默认配置，避免本次设置的
+            // 栈大小/核心亲和性残留影响后续线程创建
             SPDLOG_ERROR("创建 client event 线程失败：{}", e.what());
+            esp_pthread_cfg_t default_cfg = esp_pthread_get_default_config();
+            esp_pthread_set_cfg(&default_cfg);
             server.stop();
             return std::make_error_code(std::errc::resource_unavailable_try_again);
         }
@@ -361,9 +385,15 @@ void usbipdcpp::Esp32Server::stop() {
                     continue;
                 }
                 for (int intf_i = 0; intf_i < active_config_desc->bNumInterfaces; intf_i++) {
-                    err = usb_host_interface_release(host_client_handle, device, intf_i);
+                    int intf_offset;
+                    auto intf_desc = usb_parse_interface_descriptor(active_config_desc, intf_i, 0, &intf_offset);
+                    if (!intf_desc)
+                        continue;
+                    // release 的第三参数是 bInterfaceNumber（接口号），
+                    // 跳号接口用数组下标会释放错误的接口
+                    err = usb_host_interface_release(host_client_handle, device, intf_desc->bInterfaceNumber);
                     if (err) {
-                        SPDLOG_ERROR("释放设备接口{}时出错: {}", intf_i, esp_err_to_name(err));
+                        SPDLOG_ERROR("释放设备接口{}时出错: {}", intf_desc->bInterfaceNumber, esp_err_to_name(err));
                     }
                 }
             }
@@ -379,9 +409,15 @@ void usbipdcpp::Esp32Server::stop() {
                     continue;
                 }
                 for (int intf_i = 0; intf_i < active_config_desc->bNumInterfaces; intf_i++) {
-                    err = usb_host_interface_release(host_client_handle, device, intf_i);
+                    int intf_offset;
+                    auto intf_desc = usb_parse_interface_descriptor(active_config_desc, intf_i, 0, &intf_offset);
+                    if (!intf_desc)
+                        continue;
+                    // release 的第三参数是 bInterfaceNumber（接口号），
+                    // 跳号接口用数组下标会释放错误的接口
+                    err = usb_host_interface_release(host_client_handle, device, intf_desc->bInterfaceNumber);
                     if (err) {
-                        SPDLOG_ERROR("释放设备接口{}时出错: {}", intf_i, esp_err_to_name(err));
+                        SPDLOG_ERROR("释放设备接口{}时出错: {}", intf_desc->bInterfaceNumber, esp_err_to_name(err));
                     }
                 }
             }
