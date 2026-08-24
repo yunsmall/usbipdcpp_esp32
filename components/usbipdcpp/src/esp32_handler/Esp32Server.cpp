@@ -47,6 +47,9 @@ void usbipdcpp::Esp32Server::client_event_callback(const usb_host_client_event_m
         }
         else {
             std::lock_guard lock(this_server->all_host_devices_mutex);
+            // NEW_DEV 对每个枚举成功的设备只投递一次（usb_host 枚举完成路径，
+            // usbh.c），设备地址全局递增不复用，同一 address 不会重复出现，
+            // 无需重复绑定检查（防御性检查无触发场景）
             this_server->host_devices[event_msg->new_dev.address] = dev_handle;
             auto bind_ret = this_server->bind_host_device(dev_handle);
             if (bind_ret != ESP_OK) {
@@ -225,6 +228,10 @@ void usbipdcpp::Esp32Server::unbind_host_device(usb_device_handle_t dev) {
     }
     auto taregt_busid = esp32_get_device_busid(dev_info.dev_addr);
     {
+        // 锁序先 all_host_devices_mutex 再 devices_mutex，与 stop() /
+        // client_event_callback / remove_gone_device 保持一致，反向获取
+        // 会与它们循环等待死锁
+        std::lock_guard hlock(all_host_devices_mutex);
         // 本函数会 erase 可用设备列表（写操作），必须独占锁：shared_lock 是
         // 读锁，与 remove_gone_device 等写路径并发修改容器是数据竞争
         std::unique_lock lock(server.get_devices_mutex());
@@ -254,6 +261,15 @@ void usbipdcpp::Esp32Server::unbind_host_device(usb_device_handle_t dev) {
                     }
                 }
                 server_available_devices.erase(i);
+                // 关闭句柄并从 host_devices 移除（与 bind 时插入对应）：
+                // 不 close 则 usb_host 句柄引用计数不归零，设备被本 client
+                // 永久占用、其他 client 无法打开；不擦除条目则残留的句柄
+                // 会在后续拔出清理路径被误操作
+                err = usb_host_device_close(host_client_handle, dev);
+                if (err != ESP_OK) {
+                    SPDLOG_ERROR("关闭设备句柄{}失败: {}", static_cast<void *>(dev), esp_err_to_name(err));
+                }
+                host_devices.erase(dev_info.dev_addr);
                 spdlog::info("成功取消绑定");
                 return;
             }
@@ -288,7 +304,9 @@ usbipdcpp::error_code usbipdcpp::Esp32Server::start(asio::ip::tcp::endpoint &ep)
         }
         esp_pthread_set_cfg(&cfg);
     });
-    server.set_after_thread_create_callback([this](ThreadPurpose, std::thread&) {
+    // 第二参数是线程指针，nullptr 表示线程创建失败（库保证 before/after
+    // 成对调用）。本回调不访问线程对象，只恢复配置并解锁，两种路径一致
+    server.set_after_thread_create_callback([this](ThreadPurpose, std::thread *) {
         esp_pthread_cfg_t default_cfg = esp_pthread_get_default_config();
         esp_pthread_set_cfg(&default_cfg);
         thread_cfg_mutex.unlock();

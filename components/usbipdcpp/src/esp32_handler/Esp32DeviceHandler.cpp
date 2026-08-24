@@ -286,6 +286,14 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
     }
     else [[unlikely]] {
         SPDLOG_ERROR("端口{:02x}的未知传输类型：{}", ep.address, ep.attributes);
+        // 清理已分配的资源再返回：callback_args 已从池分配（或 new），
+        // transfer 所有权已转移至 callback_args->transfer，不清理则池槽位
+        // 与 usb_transfer_t 同时泄漏（与重复 seqnum / 提交失败路径一致）
+        callback_args->transfer.reset();
+        callback_args->reset();
+        if (!callback_args_pool_.free(callback_args)) {
+            delete callback_args;
+        }
         ec = make_error_code(ErrorType::INVALID_ARG);
         return;
     }
@@ -643,6 +651,10 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
 
     // 持有 transfers_mutex_ 进行 CANCELED 判断，使判断与重提交之间原子化，
     // 防止 handle_unlink_seqnum 在判断与重提交之间设置 unlinked 并取消端点。
+    // 入队（enqueue_ret_submit/unlink）也必须在锁内：并发完成的两个回调按拿锁
+    // 顺序入队，响应顺序与完成顺序一致；锁外入队时后完成者可能先拿锁先入队，
+    // 客户端看到完成顺序颠倒。锁内入队只是 vector push_back，成本极低，
+    // wakeup_sender 已在锁外
     {
         std::unique_lock lock(handler->transfers_mutex_);
 
