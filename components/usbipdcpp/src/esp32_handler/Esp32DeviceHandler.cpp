@@ -1224,15 +1224,39 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
                 // 未被标记 unlinked 的需要重新提交（持有 transfers_mutex_，与 handle_unlink_seqnum 互斥）
                 if (!cb->unlinked) {
                     trx->status = USB_TRANSFER_STATUS_COMPLETED;
-                    esp_err_t err;
+                    esp_err_t err = ESP_OK;
+                    bool stopping = false;
                     {
                         std::shared_lock ep_lock(handler->endpoint_cancellation_mutex);
-                        if (cb->transfer_type == USB_TRANSFER_TYPE_CTRL) {
+                        // 断连检查与重提交必须在同一临界区：on_disconnection 先置
+                        // all_transfer_should_stop 再取消端点（cancel_endpoint_all_transfers
+                        // 持 endpoint_cancellation_mutex 排他锁）。若此处不检查直接重提交，
+                        // 且提交发生在该端点取消完成之后，重提交的传输将无人取消
+                        // （断连流程不会回头），回调不再到来，pending_count_ 永不归零，
+                        // on_disconnection 永久阻塞。临界区保证：cancel 拿到排他锁前
+                        // 完成的提交必然被其 flush；置位后进入本临界区的提交被拦下
+                        if (handler->all_transfer_should_stop) {
+                            stopping = true;
+                        }
+                        else if (cb->transfer_type == USB_TRANSFER_TYPE_CTRL) {
                             err = usb_host_transfer_submit_control(handler->host_client_handle, trx);
                         }
                         else {
                             err = usb_host_transfer_submit(trx);
                         }
+                    }
+                    if (stopping) {
+                        // 断连中：与函数开头的 all_transfer_should_stop 分支相同，
+                        // 只清理不发送响应
+                        handler->transfers_.erase(cb->seqnum);
+                        lock.unlock();
+                        cb->transfer.reset();
+                        cb->reset();
+                        if (!handler->callback_args_pool_.free(cb))
+                            delete cb;
+                        // 递减放最后（见本函数末尾的完整注释）
+                        handler->decrement_pending_and_notify();
+                        return;
                     }
                     if (err != ESP_OK) {
                         SPDLOG_ERROR("seqnum为{}的传输重新提交失败：{}", cb->seqnum, esp_err_to_name(err));
@@ -1296,6 +1320,16 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
             actual_length = iso_actual;
         }
 
+        // 统计 ISO 传输中失败的包数（协议 RET_SUBMIT 的 error_count 字段；
+        // 内核 stub 由 USB 核心统计后填充，此处统计非 COMPLETED 的包等价）
+        std::uint32_t error_count = 0;
+        if (cb->transfer_type == USB_TRANSFER_TYPE_ISOCHRONOUS) [[unlikely]] {
+            for (int i = 0; i < trx->num_isoc_packets; i++) {
+                if (trx->isoc_packet_desc[i].status != USB_TRANSFER_STATUS_COMPLETED)
+                    error_count++;
+            }
+        }
+
         // 从 map 移除（与 handle_unlink_seqnum 互斥）。
         // 递减不在此处：必须放到本函数末尾（见函数末尾的完整注释）
         handler->transfers_.erase(cb->seqnum);
@@ -1310,9 +1344,20 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
         else {
             UsbIpResponse::UsbIpRetSubmit ret;
             if (cb->is_out) {
-                ret = UsbIpResponse::UsbIpRetSubmit::create_ret_submit_with_status_and_no_data(
-                        cb->seqnum, trxstat2error(trx->status), actual_length);
-                cb->transfer.reset();
+                if (cb->transfer_type == USB_TRANSFER_TYPE_ISOCHRONOUS) [[unlikely]] {
+                    // ISO OUT：转移所有权给响应，由 send_transfer_data 发送描述符
+                    // （OUT 方向不发送数据，见 Esp32TransferOperator::send_transfer_data）。
+                    // 协议要求 ISO 不分方向都返回 number_of_packets 个描述符，且
+                    // 描述符 actual_length 之和必须等于 header 的 actual_length
+                    ret = UsbIpResponse::UsbIpRetSubmit::create_ret_submit(
+                            cb->seqnum, trxstat2error(trx->status), actual_length,
+                            0, trx->num_isoc_packets, std::move(cb->transfer));
+                }
+                else {
+                    ret = UsbIpResponse::UsbIpRetSubmit::create_ret_submit_with_status_and_no_data(
+                            cb->seqnum, trxstat2error(trx->status), actual_length);
+                    cb->transfer.reset();
+                }
             }
             else {
                 ret = UsbIpResponse::UsbIpRetSubmit::create_ret_submit(
@@ -1320,6 +1365,7 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
                         actual_length, 0, trx->num_isoc_packets,
                         std::move(cb->transfer));
             }
+            ret.error_count = error_count;
             SPDLOG_DEBUG("esp32传输actual_length为{}个字节", actual_length);
             LATENCY_TRACK(handler->session->latency_tracker, cb->seqnum,
                           "Esp32DeviceHandler::transfer_callback submit_ret_submit");
