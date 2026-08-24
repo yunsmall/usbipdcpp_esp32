@@ -127,6 +127,11 @@ namespace usbipdcpp
         std::mutex transfer_complete_mutex_;
         std::condition_variable transfer_complete_cv_;
 
+        // 传输计数递减并通知 on_disconnection 的等待（递减与 notify 统一在
+        // transfer_complete_mutex_ 下进行，防止谓词修改与检查不互斥导致丢唤醒）
+        void decrement_pending_and_notify();
+        void decrement_chunked_and_notify();
+
         // 非分块传输表：seqnum → callback_args*（参考 libusb 模型）
         std::mutex transfers_mutex_;
         std::unordered_map<std::uint32_t, esp32_callback_args*> transfers_;
@@ -147,9 +152,10 @@ namespace usbipdcpp
         // 同端点分块传输进行中标记，防止多个分块传输同时占用同一 pipe
         std::mutex active_chunked_eps_mutex_;
         std::set<uint8_t> active_chunked_eps_;
-        // 提交分块传输的第一个 chunk（从 receive_urb 或 deferred 出队后调用）
-        void submit_first_chunk(ChunkedTransfer* ct, esp32_callback_args* cb,
-                                const UsbEndpoint& ep, std::uint32_t transfer_flags);
+        // 提交分块传输的第一个 chunk（从 receive_urb 或 deferred 出队后调用）。
+        // 返回 ESP_OK 表示已入 pipe（可能在飞行或已完成），错误表示未进入 pipe
+        esp_err_t submit_first_chunk(ChunkedTransfer* ct, esp32_callback_args* cb,
+                                     const UsbEndpoint& ep, std::uint32_t transfer_flags);
         // 出队并处理指定端点的下一个 pending transfer
         void process_pending_urb(uint8_t ep_addr);
 

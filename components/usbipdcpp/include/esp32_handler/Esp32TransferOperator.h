@@ -54,6 +54,9 @@ struct ChunkedTransfer {
     int current_chunk = 0;
     // 原始 CMD_SUBMIT 的 transfer_flags，回调提交后续分块时计算 ZLP 位
     std::uint32_t transfer_flags = 0;
+    // 排队期间收到 CMD_UNLINK（传输尚未开始，ct->cb 为空）时置 true，
+    // 出队后 receive_urb 发现并丢弃该传输
+    std::atomic<bool> unlink_pending{false};
     // 本笔分块传输对应的回调参数（receive_urb 设置）。
     // handle_unlink_seqnum 直接用此字段找 cb，而不是遍历 transfers 读
     // trx->context：回调完成路径会无锁地把已完成的 chunk 置 null 并释放

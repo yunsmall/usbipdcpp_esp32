@@ -18,7 +18,9 @@ namespace usbipdcpp
         Esp32Server();
 
         void init_client();
-        void bind_host_device(usb_device_handle_t dev);
+        // 绑定设备到可用设备列表。失败时已回滚已声明接口并关闭设备句柄，
+        // 返回错误码供调用方从 host_devices 中移除该句柄
+        esp_err_t bind_host_device(usb_device_handle_t dev);
         void unbind_host_device(usb_device_handle_t device);
         void start(asio::ip::tcp::endpoint& ep);
         void stop();

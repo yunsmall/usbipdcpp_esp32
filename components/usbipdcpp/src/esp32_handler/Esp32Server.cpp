@@ -48,12 +48,23 @@ void usbipdcpp::Esp32Server::client_event_callback(const usb_host_client_event_m
         else {
             std::lock_guard lock(this_server->all_host_devices_mutex);
             this_server->host_devices[event_msg->new_dev.address] = dev_handle;
-            this_server->bind_host_device(dev_handle);
+            auto bind_ret = this_server->bind_host_device(dev_handle);
+            if (bind_ret != ESP_OK) {
+                // 绑定失败：句柄已在 bind_host_device 内关闭，从 map 移除，
+                // 防止设备拔除时 remove_gone_device 对已关闭句柄误操作
+                this_server->host_devices.erase(event_msg->new_dev.address);
+            }
         }
     }
     else {
         spdlog::info("A device with handle {} has gone", static_cast<void *>(event_msg->dev_gone.dev_hdl));
         this_server->remove_gone_device(event_msg->dev_gone.dev_hdl);
+
+        // 无需等待 session 线程退出：usbh 在 DEV_GONE 消息进入 client 队列
+        // 之前已把所有传输回调派发完毕（usbh_process 动作顺序 EPn_HALT_FLUSH
+        // 先于 PROP_GONE_EVT，回调先于 device_removed_ 置位完成），session 的
+        // 传输侧已无活动，其退出路径不触碰 usb 句柄。此处的 release/close 是
+        // ESP-IDF 对 DEV_GONE 事件的标准清理流程
 
         const usb_config_desc_t *active_config_desc = nullptr;
         auto err = usb_host_get_active_config_descriptor(event_msg->dev_gone.dev_hdl, &active_config_desc);
@@ -83,26 +94,30 @@ void usbipdcpp::Esp32Server::client_event_callback(const usb_host_client_event_m
     }
 }
 
-void usbipdcpp::Esp32Server::bind_host_device(usb_device_handle_t dev) {
+esp_err_t usbipdcpp::Esp32Server::bind_host_device(usb_device_handle_t dev) {
     usb_device_info_t dev_info;
     auto err = usb_host_device_info(dev, &dev_info);
     if (err != ESP_OK) {
         spdlog::warn("无法获取设备信息，忽略这个设备：{}", esp_err_to_name(err));
-        return;
+        // 失败统一关闭句柄，否则设备一直被占用无法重新绑定
+        usb_host_device_close(host_client_handle, dev);
+        return err;
     }
 
     const usb_device_desc_t *device_descriptor = nullptr;
     err = usb_host_get_device_descriptor(dev, &device_descriptor);
     if (err != ESP_OK) {
         spdlog::warn("无法获取设备描述符，忽略这个设备：{}", esp_err_to_name(err));
-        return;
+        usb_host_device_close(host_client_handle, dev);
+        return err;
     }
 
     const usb_config_desc_t *active_config_desc = nullptr;
     err = usb_host_get_active_config_descriptor(dev, &active_config_desc);
     if (err) {
         spdlog::warn("无法获取设备当前的配置描述符，忽略这个设备：{}", esp_err_to_name(err));
-        return;
+        usb_host_device_close(host_client_handle, dev);
+        return err;
     }
 
     SPDLOG_DEBUG("该设备有{}个interface", active_config_desc->bNumInterfaces);
@@ -124,7 +139,8 @@ void usbipdcpp::Esp32Server::bind_host_device(usb_device_handle_t dev) {
                     SPDLOG_ERROR("回滚释放接口{}失败: {}", claimed_i, esp_err_to_name(rel_ret));
                 }
             }
-            return;
+            usb_host_device_close(host_client_handle, dev);
+            return err;
         }
 
         std::vector<UsbEndpoint> endpoints;
@@ -178,6 +194,7 @@ void usbipdcpp::Esp32Server::bind_host_device(usb_device_handle_t dev) {
         current_device->with_handler<Esp32DeviceHandler>(dev, host_client_handle);
         server_available_devices.emplace_back(std::move(current_device));
     }
+    return ESP_OK;
 }
 
 void usbipdcpp::Esp32Server::unbind_host_device(usb_device_handle_t dev) {
@@ -288,6 +305,15 @@ void usbipdcpp::Esp32Server::start(asio::ip::tcp::endpoint &ep) {
 void usbipdcpp::Esp32Server::stop() {
     server.stop();
 
+    // 先停 client 事件线程再释放接口：否则设备拔出回调（client_event_thread
+    // 中执行）可能与下方的 usb_host_interface_release 并发，同一接口释放
+    // 两次或操作已关闭的句柄
+    should_exit_client_event_thread = true;
+    usb_host_client_unblock(host_client_handle);
+    spdlog::info("等待client handle事件线程结束");
+    client_event_thread.join();
+    spdlog::info("client handle事件线程结束");
+
     {
         std::shared_lock lock(server.get_devices_mutex());
         auto &server_available_devices = server.get_available_devices();
@@ -328,11 +354,6 @@ void usbipdcpp::Esp32Server::stop() {
         }
     }
 
-    should_exit_client_event_thread = true;
-    usb_host_client_unblock(host_client_handle);
-    spdlog::info("等待client handle事件线程结束");
-    client_event_thread.join();
-    spdlog::info("client handle事件线程结束");
 }
 
 usbipdcpp::Esp32Server::~Esp32Server() {
