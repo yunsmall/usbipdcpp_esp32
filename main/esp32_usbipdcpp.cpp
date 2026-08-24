@@ -256,7 +256,11 @@ int thread_main() {
     // server.add_device(std::move(mock_mouse));
 
     asio::ip::tcp::endpoint endpoint{asio::ip::tcp::v4(), listening_port};
-    server.start(endpoint);
+    auto ec = server.start(endpoint);
+    if (ec) [[unlikely]] {
+        ESP_LOGE(TAG, "服务器启动失败：{}", ec.message());
+        return;
+    }
 
     // SPDLOG_INFO("Start turning over left button");
     // while (true) {

@@ -619,6 +619,11 @@ void usbipdcpp::Esp32DeviceHandler::cancel_all_transfer() {
 }
 
 void usbipdcpp::Esp32DeviceHandler::cancel_endpoint_all_transfers(uint8_t bEndpointAddress) {
+    // 持锁调用 halt/flush/clear 不会死锁：三者都是异步入队动作
+    // （usb_host_endpoint_halt/flush/clear 内部只是 usbh_ep_command 把
+    // USBH_EP_CMD_* 发给 usbh_process 处理，依据 ESP-IDF v5.5 usb_host.c），
+    // 不等待传输回调执行；回调线程（client_event_thread）最多阻塞到本函数
+    // 释放锁（微秒级），随后可正常拿共享锁重提交
     std::lock_guard lock(endpoint_cancellation_mutex);
     esp_err_t err;
     err = usb_host_endpoint_halt(native_handle, bEndpointAddress);
@@ -874,6 +879,11 @@ void usbipdcpp::Esp32DeviceHandler::decrement_pending_and_notify() {
         std::lock_guard lock(transfer_complete_mutex_);
         pending_count_.fetch_sub(1, std::memory_order_release);
     }
+    // notify 在锁外是标准推荐做法（cppreference），不存在丢失唤醒窗口：
+    // 谓词修改（fetch_sub）在锁内完成，等待者的 wait 以原子操作"释放锁并
+    // 注册睡眠"，通知者不可能在"等待者检查谓词之后、注册睡眠之前"修改
+    // 谓词——递减要么发生在检查前（等待者看到谓词为真不入睡），要么在
+    // wait 已注册睡眠之后（notify 必达）
     transfer_complete_cv_.notify_one();
 }
 
@@ -1223,6 +1233,11 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
                 // ESP32 取消端点时会连带取消该端点所有 transfer
                 // 未被标记 unlinked 的需要重新提交（持有 transfers_mutex_，与 handle_unlink_seqnum 互斥）
                 if (!cb->unlinked) {
+                    // 无需重置 actual_num_bytes / isoc 包 actual_num_bytes：
+                    // hcd 在取消完成时统一清零（hcd_dwc.c 的 _buffer_parse_error
+                    // 与 flush 路径都对被取消的 URB 写 actual_num_bytes = 0，
+                    // ISO 包同样清零），CANCELED 回调读到的必为 0；重提交
+                    // 完成后由 hcd 写入新值
                     trx->status = USB_TRANSFER_STATUS_COMPLETED;
                     esp_err_t err = ESP_OK;
                     bool stopping = false;

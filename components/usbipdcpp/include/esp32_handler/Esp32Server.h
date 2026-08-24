@@ -22,7 +22,9 @@ namespace usbipdcpp
         // 返回错误码供调用方从 host_devices 中移除该句柄
         esp_err_t bind_host_device(usb_device_handle_t dev);
         void unbind_host_device(usb_device_handle_t device);
-        void start(asio::ip::tcp::endpoint& ep);
+        // start 承诺不抛异常，错误通过 error_code 报告（与 Server::start /
+        // LibusbServer::start 一致，便于无异常环境的嵌入式平台）
+        usbipdcpp::error_code start(asio::ip::tcp::endpoint& ep);
         void stop();
 
         ~Esp32Server();
