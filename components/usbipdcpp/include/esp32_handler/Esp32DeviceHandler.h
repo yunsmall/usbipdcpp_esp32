@@ -33,7 +33,6 @@ namespace usbipdcpp
         std::uint32_t seqnum;
         usb_transfer_type_t transfer_type;
         bool is_out;
-        ChunkedTransfer* chunked = nullptr;  // 分块传输的共享状态
         bool unlinked = false;                // CMD_UNLINK 已到达
         std::uint32_t unlink_cmd_seqnum = 0;
         std::uint32_t original_transfer_buffer_length = 0;
@@ -45,7 +44,6 @@ namespace usbipdcpp
             seqnum = 0;
             transfer_type = static_cast<usb_transfer_type_t>(0);
             is_out = false;
-            chunked = nullptr;
             unlinked = false;
             unlink_cmd_seqnum = 0;
             original_transfer_buffer_length = 0;
@@ -117,7 +115,6 @@ namespace usbipdcpp
         int tweak_special_requests(const SetupPacket& setup_packet);
 
         static void transfer_callback(usb_transfer_t* trx);
-        static void chunked_transfer_callback(usb_transfer_t* trx);
 
         // 对象池：64个
         using CallbackArgsPool = ObjectPool<esp32_callback_args, 64, true>;
@@ -130,40 +127,11 @@ namespace usbipdcpp
         // 传输计数递减并通知 on_disconnection 的等待（递减与 notify 统一在
         // transfer_complete_mutex_ 下进行，防止谓词修改与检查不互斥导致丢唤醒）
         void decrement_pending_and_notify();
-        void decrement_chunked_and_notify();
 
         // 非分块传输表：seqnum → callback_args*（参考 libusb 模型）
         std::mutex transfers_mutex_;
         std::unordered_map<std::uint32_t, esp32_callback_args*> transfers_;
         std::atomic<std::size_t> pending_count_{0};
-
-        // 分块传输计数（分块状态本身在 Esp32TransferOperator 中）
-        std::atomic<int> chunked_count_{0};
-
-        // 同端点串行化：端点有分块传输正在处理时，新来的传输入队等待
-        // 避免一次性提交多个分块阻塞 pipe，也防止多个传输交织打乱顺序
-        struct DeferredUrb {
-            UsbIpCommand::UsbIpCmdSubmit cmd;
-            UsbEndpoint ep;
-            std::optional<UsbInterface> interface;
-        };
-        std::mutex deferred_urbs_mutex_;
-        std::unordered_map<uint8_t, std::queue<DeferredUrb>> deferred_urbs_;
-        // 同端点分块传输进行中标记，防止多个分块传输同时占用同一 pipe。
-        // 值为当前占用该端点传输的 seqnum（所有权标识）：process_pending_urb
-        // 弹出队头时在同一把锁内原子接管端点（记下本笔 seqnum），receive_urb
-        // 据此区分"本笔刚从队列出队（active 属于自己，可提交）"与"新到达的
-        // 传输（active 被他人占用，入队）"——若用 set 无法区分这两者，出队的
-        // URB 会被"队列非空"挡回自己排到队尾，无飞行传输再触发后续出队，
-        // 端点永久卡死
-        std::mutex active_chunked_eps_mutex_;
-        std::unordered_map<uint8_t, std::uint32_t> active_chunked_eps_;
-        // 提交分块传输的第一个 chunk（从 receive_urb 或 deferred 出队后调用）。
-        // 返回 ESP_OK 表示已入 pipe（可能在飞行或已完成），错误表示未进入 pipe
-        esp_err_t submit_first_chunk(ChunkedTransfer* ct, esp32_callback_args* cb,
-                                     const UsbEndpoint& ep, std::uint32_t transfer_flags);
-        // 出队并处理指定端点的下一个 pending transfer
-        void process_pending_urb(uint8_t ep_addr);
 
         static const char* TAG;
 

@@ -161,6 +161,9 @@ esp_err_t usbipdcpp::Esp32Server::bind_host_device(usb_device_handle_t dev) {
                         .interface_class = intf_desc->bInterfaceClass,
                         .interface_subclass = intf_desc->bInterfaceSubClass,
                         .interface_protocol = intf_desc->bInterfaceProtocol,
+                        // 跳号接口（如只有接口 0 和 2）时下标≠接口号，必须按
+                        // 描述符的 bInterfaceNumber 填充，SET_INTERFACE 才匹配正确
+                        .interface_number = intf_desc->bInterfaceNumber,
                         // endpoints 按 altsetting 分组，这里只使用第一个 altsetting（alt 0）
                         .endpoints = {std::move(endpoints)}
                 }
@@ -206,7 +209,9 @@ void usbipdcpp::Esp32Server::unbind_host_device(usb_device_handle_t dev) {
     }
     auto taregt_busid = esp32_get_device_busid(dev_info.dev_addr);
     {
-        std::shared_lock lock(server.get_devices_mutex());
+        // 本函数会 erase 可用设备列表（写操作），必须独占锁：shared_lock 是
+        // 读锁，与 remove_gone_device 等写路径并发修改容器是数据竞争
+        std::unique_lock lock(server.get_devices_mutex());
         auto &server_available_devices = server.get_available_devices();
         for (auto i = server_available_devices.begin(); i != server_available_devices.end(); ++i) {
             if ((*i)->busid == taregt_busid) {
@@ -269,12 +274,15 @@ void usbipdcpp::Esp32Server::start(asio::ip::tcp::endpoint &ep) {
 
     server.start(ep);
 
-    thread_cfg_mutex.lock();
-    esp_pthread_cfg_t pthread_cfg = esp_pthread_get_default_config();
-    pthread_cfg.pin_to_core = 1;
-    pthread_cfg.thread_name = "Esp32Server client_event_thread";
-    pthread_cfg.stack_size = 5120;
-    esp_pthread_set_cfg(&pthread_cfg);
+    {
+        // RAII 持锁：std::thread 构造抛异常（资源不足）时锁自动释放，不会
+        // 因未解锁阻塞后续所有线程创建（before/after 回调也用本锁互斥）
+        std::lock_guard cfg_lock(thread_cfg_mutex);
+        esp_pthread_cfg_t pthread_cfg = esp_pthread_get_default_config();
+        pthread_cfg.pin_to_core = 1;
+        pthread_cfg.thread_name = "Esp32Server client_event_thread";
+        pthread_cfg.stack_size = 5120;
+        esp_pthread_set_cfg(&pthread_cfg);
     client_event_thread = std::thread([this]() {
         try {
             SPDLOG_INFO("启动一个client event handle的事件循环线程");
@@ -297,9 +305,9 @@ void usbipdcpp::Esp32Server::start(asio::ip::tcp::endpoint &ep) {
             std::exit(1);
         }
     });
-    esp_pthread_cfg_t default_cfg = esp_pthread_get_default_config();
-    esp_pthread_set_cfg(&default_cfg);
-    thread_cfg_mutex.unlock();
+        esp_pthread_cfg_t default_cfg = esp_pthread_get_default_config();
+        esp_pthread_set_cfg(&default_cfg);
+    }
 }
 
 void usbipdcpp::Esp32Server::stop() {
@@ -315,6 +323,10 @@ void usbipdcpp::Esp32Server::stop() {
     spdlog::info("client handle事件线程结束");
 
     {
+        // 先取 all_host_devices_mutex 再取 devices_mutex，与 client_event_callback
+        // / remove_gone_device 的锁序保持一致：若反向获取，stop() 与设备拔出
+        // 事件并发时会循环等待死锁
+        std::lock_guard hlock(all_host_devices_mutex);
         std::unique_lock lock(server.get_devices_mutex());
         auto &server_available_devices = server.get_available_devices();
         for (auto avail_dev_i = server_available_devices.begin(); avail_dev_i != server_available_devices.end(); ++avail_dev_i) {
@@ -360,17 +372,14 @@ void usbipdcpp::Esp32Server::stop() {
         // 析构），残留的无效句柄会在后续绑定/传输中出错。此处无并发：
         // server.stop() 已等待所有 session 退出（active_sessions 归零），
         // on_disconnection 已确保全部传输回调执行完毕
-        {
-            std::lock_guard hlock(all_host_devices_mutex);
-            for (auto &entry: host_devices) {
-                auto dev = entry.second;
-                auto err = usb_host_device_close(host_client_handle, dev);
-                if (err != ESP_OK) {
-                    SPDLOG_ERROR("关闭设备句柄{}失败: {}", static_cast<void *>(dev), esp_err_to_name(err));
-                }
+        for (auto &entry: host_devices) {
+            auto dev = entry.second;
+            auto err = usb_host_device_close(host_client_handle, dev);
+            if (err != ESP_OK) {
+                SPDLOG_ERROR("关闭设备句柄{}失败: {}", static_cast<void *>(dev), esp_err_to_name(err));
             }
-            host_devices.clear();
         }
+        host_devices.clear();
         server_available_devices.clear();
         server_using_devices.clear();
     }

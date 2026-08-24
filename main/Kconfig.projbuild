@@ -9,24 +9,3 @@ menu "Usbipdcpp WiFi Configuration"
         default "default_password"
 
 endmenu
-
-menu "USB/IP Transfer Configuration"
-
-    config USBIPD_ENABLE_CHUNKED_TRANSFER
-        bool "Enable chunked USB transfer"
-        default y
-        help
-            When enabled, USB bulk/interrupt transfers larger than
-            USBIPD_MAX_CHUNK_SIZE are split into multiple smaller chunks
-            to reduce DMA memory pressure.
-
-    config USBIPD_MAX_CHUNK_SIZE
-        int "Maximum single USB transfer chunk size (bytes)"
-        default 4096
-        range 64 16384
-        help
-            USB bulk/interrupt transfers larger than this will be split into
-            multiple smaller chunks to reduce DMA memory pressure. Smaller
-            values save DMA memory but add per-chunk overhead.
-
-endmenu
