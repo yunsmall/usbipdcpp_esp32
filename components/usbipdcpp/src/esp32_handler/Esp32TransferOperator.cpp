@@ -112,7 +112,24 @@ void* Esp32TransferOperator::alloc_transfer_handle(std::size_t buffer_length, in
                     buffer_length, ct->transfers.size(), chunk_size,
                     static_cast<void*>(ct->in_data));
         std::lock_guard lock(chunked_transfers_mutex_);
-        chunked_transfers_[header.seqnum] = ct;
+        // 拒绝重复 seqnum：分块表以 seqnum 为 key，重复会覆盖旧条目，
+        // 旧 ChunkedTransfer 泄漏且其回调/取消语义错乱。协议要求 seqnum
+        // 单调递增（内核 vhci 原子递增），重复属客户端违规，直接中止本次
+        // 传输（返回 nullptr 由协议层报错断开连接，参考 protocol.cpp 的
+        // alloc 失败处理）
+        if (chunked_transfers_.contains(header.seqnum)) [[unlikely]] {
+            SPDLOG_ERROR("CHUNKED 重复 seqnum={}，中止本次传输", header.seqnum);
+            for (auto* t: ct->transfers)
+                usb_host_transfer_free(t);
+            ct->transfers.clear();
+            if (ct->in_data)
+                heap_caps_free(ct->in_data);
+            ct->in_data = nullptr;
+            if (!chunked_pool_.free(ct))
+                delete ct;
+            return nullptr;
+        }
+        chunked_transfers_.emplace(header.seqnum, ct);
         return ct;
     }
 
@@ -195,7 +212,9 @@ void Esp32TransferOperator::free_transfer_handle(void* transfer_handle)
             if (t)
                 usb_host_transfer_free(t);
         ct->transfers.clear();
-        heap_caps_free(ct->in_data);
+        // heap_caps_free(nullptr) 本身安全，这里显式判空让意图更明确
+        if (ct->in_data)
+            heap_caps_free(ct->in_data);
         ct->in_data = nullptr;
         ct->in_short = false;
         ct->transfer_started = false;
@@ -228,6 +247,11 @@ void Esp32TransferOperator::send_transfer_data(void* handle, asio::ip::tcp::sock
                 std::size_t remaining = length;
                 for (std::size_t i = 0; i < ct->transfers.size() && remaining > 0 && !ec; i++) {
                     auto* trx = ct->transfers[i];
+                    // 已完成的分块在回调中被置 null 并释放，防御性跳过
+                    // （正常 IN 分块必有 in_data 不会走到此分支，仅防御
+                    // in_data 意外为空的路径）
+                    if (!trx) [[unlikely]]
+                        continue;
                     std::size_t chunk_len = std::min(
                             remaining, static_cast<std::size_t>(trx->actual_num_bytes));
                     if (chunk_len > 0) {

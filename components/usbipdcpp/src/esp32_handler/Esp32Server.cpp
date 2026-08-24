@@ -315,7 +315,7 @@ void usbipdcpp::Esp32Server::stop() {
     spdlog::info("client handle事件线程结束");
 
     {
-        std::shared_lock lock(server.get_devices_mutex());
+        std::unique_lock lock(server.get_devices_mutex());
         auto &server_available_devices = server.get_available_devices();
         for (auto avail_dev_i = server_available_devices.begin(); avail_dev_i != server_available_devices.end(); ++avail_dev_i) {
             if (auto esp32_device_handler = std::dynamic_pointer_cast<Esp32DeviceHandler>((*avail_dev_i)->handler)) {
@@ -352,6 +352,27 @@ void usbipdcpp::Esp32Server::stop() {
                 }
             }
         }
+
+        // 接口已全部释放、句柄不再被接口占用：关闭所有设备句柄并清空记录。
+        // 若不关闭，usb_host 设备句柄（引用计数管理）泄漏，设备被本 client
+        // 永久占用，停止后无法重新打开。句柄关闭后 UsbDevice 中保存的
+        // native_handle 失效，必须同时把设备从可用/使用列表移除（UsbDevice
+        // 析构），残留的无效句柄会在后续绑定/传输中出错。此处无并发：
+        // server.stop() 已等待所有 session 退出（active_sessions 归零），
+        // on_disconnection 已确保全部传输回调执行完毕
+        {
+            std::lock_guard hlock(all_host_devices_mutex);
+            for (auto &entry: host_devices) {
+                auto dev = entry.second;
+                auto err = usb_host_device_close(host_client_handle, dev);
+                if (err != ESP_OK) {
+                    SPDLOG_ERROR("关闭设备句柄{}失败: {}", static_cast<void *>(dev), esp_err_to_name(err));
+                }
+            }
+            host_devices.clear();
+        }
+        server_available_devices.clear();
+        server_using_devices.clear();
     }
 
 }

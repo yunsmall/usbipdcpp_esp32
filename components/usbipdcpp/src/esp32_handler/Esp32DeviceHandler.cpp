@@ -80,16 +80,24 @@ void usbipdcpp::Esp32DeviceHandler::on_disconnection(error_code &ec) {
     all_transfer_should_stop = true;
 
     if (device_removed_) [[unlikely]] {
-        // 设备已移除时无需再取消传输/等待回调：usb_host 保证此时所有传输
-        // 回调已执行完毕。依据（ESP-IDF v5.5 usb 组件源码）：
-        // - usbh_process 的设备动作顺序：EPn_HALT_FLUSH（产生 URB 完成事件）
-        //   先于 PROP_GONE_EVT（把 DEV_GONE 消息发进 client 事件队列）
-        // - usb_host_client_handle_events 每轮循环先 _handle_pending_ep 派发
-        //   传输回调，最后才处理事件消息队列（DEV_GONE → device_removed_）
-        // 因此回调（含 sync_control_transfer 的 semaphore release）都先于
-        // device_removed_ 置位完成，此处可直接返回，不存在回调晚于 handler
-        // 析构访问的窗口。
-        SPDLOG_WARN("设备已移除，不需要停止传输");
+        // 设备已移除：usbh 已对设备全部端点做 HALT_FLUSH，所有传输回调已
+        // 入队（在 client 事件线程排队执行），无需再 cancel——设备 gone 后
+        // halt/flush/clear 无意义且可能对失效句柄报错。
+        // 但必须等待计数归零再返回：device_removed_ 也可能被 NO_DEVICE 状态
+        // 的传输回调提前置位（该回调只是事件队列中的第一个，其余端点回调
+        // 可能尚未执行），若直接返回，session 收尾会立即销毁 handler，未
+        // 执行的回调访问 handler 即 UAF。等待必然结束：usbh 已 flush 全部
+        // URB，回调最终都会执行并递减计数（DEV_GONE 路径下回调先于
+        // DEV_GONE 消息执行完毕——usbh_process 动作顺序 EPn_HALT_FLUSH 先于
+        // PROP_GONE_EVT，usb_host_client_handle_events 每轮先 _handle_pending_ep
+        // 派发回调再处理事件消息队列，依据 ESP-IDF v5.5 usb 组件源码）
+        SPDLOG_WARN("设备已移除，等待全部传输回调完成");
+        {
+            std::unique_lock lock(transfer_complete_mutex_);
+            transfer_complete_cv_.wait(lock, [this]() {
+                return pending_count_ == 0 && chunked_count_ == 0;
+            });
+        }
         AbstDeviceHandler::on_disconnection(ec);
         return;
     }
@@ -98,7 +106,11 @@ void usbipdcpp::Esp32DeviceHandler::on_disconnection(error_code &ec) {
     // 控制端点（ep0）无法在此单独取消：usbh_ep_get_handle 只认接口端点表，
     // 对 ep0 返回 ESP_ERR_NOT_FOUND。挂起的控制传输会在设备正常响应/STALL
     // 后回调，回调走 all_transfer_should_stop 分支收尾递减计数，不会让下方
-    // 等待永久阻塞；设备已移除的场景由上面的提前返回分支覆盖
+    // 等待永久阻塞；设备已移除的场景由上面的提前返回分支覆盖。
+    // 注意：ESP-IDF v5.5 无传输超时机制（usb_transfer_t.timeout_ms 注释明确
+    // "currently not supported yet"，usbh/usb_host 无超时逻辑），若设备永久
+    // 无响应（硬件故障/恶意设备），挂起的控制传输既不回调也无法取消，下方
+    // 等待会永久阻塞——这是框架限制，此层无法解决
     for (const auto &intf: handle_device.interfaces) {
         for (const auto &ep: intf.current_endpoints()) {
             cancel_endpoint_all_transfers(ep.address);
@@ -137,7 +149,7 @@ void usbipdcpp::Esp32DeviceHandler::handle_unlink_seqnum(std::uint32_t unlink_se
     // 恒 < transfers.size()，条件永远为 true，导致 unlink 永远不 cancel 卡
     // 住的分块。transfer_started 直接反映"是否已有分块成功完成"，语义准确。
     {
-        std::lock_guard lock(transfer_operator_->chunked_transfers_mutex_);
+        std::unique_lock lock(transfer_operator_->chunked_transfers_mutex_);
         auto it = transfer_operator_->chunked_transfers_.find(unlink_seqnum);
         if (it != transfer_operator_->chunked_transfers_.end()) {
             auto *ct = it->second;
@@ -158,7 +170,15 @@ void usbipdcpp::Esp32DeviceHandler::handle_unlink_seqnum(std::uint32_t unlink_se
                     SPDLOG_INFO("handle_unlink_seqnum seqnum={}: transfer already started, skip cancel", unlink_seqnum);
                 }
                 else {
-                    cancel_endpoint_all_transfers(ct->ep_address);
+                    // 锁内保存端点地址，解锁后再 cancel：cancel_endpoint_all_transfers
+                    // 内 halt/flush/clear 是同步调用且获取 endpoint_cancellation_mutex
+                    // 排他锁，锁内调用会长时间持有 chunked_transfers_mutex_，阻塞
+                    // 分块回调的查找与重提交路径。解锁后 ct 可能已被回调释放
+                    // （完成路径的 free_transfer_handle 从 map 移除并归还 ct），
+                    // 只能使用保存的端点地址
+                    auto ep_addr = ct->ep_address;
+                    lock.unlock();
+                    cancel_endpoint_all_transfers(ep_addr);
                 }
             }
             else {
@@ -220,8 +240,21 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
     if (is_control) [[unlikely]] {
         auto tweak_ret = tweak_special_requests(setup_packet);
         if (tweak_ret >= 0) {
-            session->submit_ret_submit(
-                    UsbIpResponse::UsbIpRetSubmit::create_ret_submit_ok_without_data(seqnum, transfer_buffer_length));
+            // tweak_ret == 0：tweak 成功（CLEAR_FEATURE 已同步完成、SET_INTERFACE
+            // alt=0 无需操作），回复成功
+            // tweak_ret > 0：tweak 失败（esp 错误码，如 set_interface alt!=0
+            // 不支持、clear_halt 失败），不能回复成功——客户端会误以为操作
+            // 已生效，按 EPIPE 回复让客户端感知失败
+            if (tweak_ret == 0) {
+                session->submit_ret_submit(
+                        UsbIpResponse::UsbIpRetSubmit::create_ret_submit_ok_without_data(seqnum, transfer_buffer_length));
+            }
+            else {
+                SPDLOG_ERROR("tweak 特殊控制请求失败：seqnum={}, err={}", seqnum,
+                             esp_err_to_name(static_cast<esp_err_t>(tweak_ret)));
+                session->submit_ret_submit(
+                        UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum, 0));
+            }
             return;
         }
     }
@@ -253,6 +286,15 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
             // 所有 chunk 并从 map 移除 ct
             if (ct->unlink_pending) [[unlikely]] {
                 SPDLOG_INFO("CHUNKED seqnum={} ep={:02x} dropped (unlinked while queued)", seqnum, ep.address);
+                // 本笔若由 process_pending_urb 投递，端点已被它接管（active
+                // 标记属于本笔），必须擦除并出队下一笔，否则端点残留标记；
+                // Session 正常路径下 active 未插入，erase 无操作、队列空时
+                // process_pending_urb 直接返回，两种情况都安全
+                {
+                    std::lock_guard lock(active_chunked_eps_mutex_);
+                    active_chunked_eps_.erase(ep.address);
+                }
+                process_pending_urb(ep.address);
                 return;
             }
 
@@ -261,11 +303,24 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
             // active_chunked_eps_，回调擦除标记后、process_pending_urb 出队
             // 前的间隙里，新到达的传输会直接提交，插到已排队传输的前面，
             // 同一端点的请求乱序。
+            // 端点所有权判断（active_chunked_eps_ 记录占用端点的传输 seqnum）：
+            // - active 存在且属于本笔（process_pending_urb 弹出时已原子接管
+            //   端点）：本笔就是队头，可提交，队列剩项不构成忙——否则本笔
+            //   会被自己重新入队，队列永不清空且无飞行传输再触发
+            //   process_pending_urb，端点永久卡死
+            // - active 存在且属于其他传输：端点被占用，入队
+            // - active 不存在：端点空闲；新到达的传输若队列非空仍须入队
+            //   （防插队），空闲则直接提交
             {
                 std::lock_guard lock(active_chunked_eps_mutex_);
                 std::lock_guard dlock(deferred_urbs_mutex_);
-                bool busy = active_chunked_eps_.count(ep.address)
-                            || !deferred_urbs_[ep.address].empty();
+                bool busy;
+                if (active_chunked_eps_.contains(ep.address)) {
+                    busy = active_chunked_eps_[ep.address] != seqnum;
+                }
+                else {
+                    busy = !deferred_urbs_[ep.address].empty();
+                }
                 if (busy) {
                     deferred_urbs_[ep.address].push(DeferredUrb{
                             std::move(cmd), ep, interface
@@ -273,7 +328,7 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
                     SPDLOG_INFO("CHUNKED seqnum={} ep={:02x} queued (endpoint busy)", seqnum, ep.address);
                     return;
                 }
-                active_chunked_eps_.insert(ep.address);
+                active_chunked_eps_[ep.address] = seqnum;
             }
 
             ct->seqnum = seqnum;
@@ -347,10 +402,16 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
         {
             std::lock_guard lock(active_chunked_eps_mutex_);
             std::lock_guard dlock(deferred_urbs_mutex_);
-            // 忙 = 分块在飞行 或 已有排队传输（保持 FIFO，防止插队乱序，
-            // 见上方分块分支的注释）
-            bool busy = active_chunked_eps_.count(ep.address)
-                        || !deferred_urbs_[ep.address].empty();
+            // 忙判断同上方分块分支：active 属于其他传输 → 入队；active 属于
+            // 本笔（process_pending_urb 刚接管）→ 可提交；active 空闲且队列
+            // 非空（本笔是新到达的）→ 入队防插队；空闲且队列空 → 提交
+            bool busy;
+            if (active_chunked_eps_.contains(ep.address)) {
+                busy = active_chunked_eps_[ep.address] != seqnum;
+            }
+            else {
+                busy = !deferred_urbs_[ep.address].empty();
+            }
             if (busy) {
                 deferred_urbs_[ep.address].push(DeferredUrb{
                         std::move(cmd), ep, interface
@@ -358,7 +419,7 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
                 SPDLOG_INFO("seqnum={} ep={:02x} queued (non-chunked, endpoint busy)", seqnum, ep.address);
                 return;
             }
-            active_chunked_eps_.insert(ep.address);
+            active_chunked_eps_[ep.address] = seqnum;
         }
     }
 
@@ -452,10 +513,34 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
         return;
     }
 
-    // 注册到传输表
+    // 注册到传输表。拒绝重复 seqnum（参照 LibusbDeviceHandler）：transfers_
+    // 以 seqnum 为 key，重复会让两个在途传输共用一个 entry，erase/取消
+    // 语义错乱（RET_SUBMIT 与 RET_UNLINK 可能乱序），旧条目还会泄漏。
+    // 协议要求 seqnum 单调递增（内核 vhci 原子递增），重复属客户端违规。
+    // 本次传输不提交给设备，按 EPIPE 回复
     {
         std::unique_lock lock(transfers_mutex_);
-        transfers_[seqnum] = callback_args;
+        if (transfers_.contains(seqnum)) [[unlikely]] {
+            lock.unlock();
+            callback_args->transfer.reset();
+            callback_args->reset();
+            if (!callback_args_pool_.free(callback_args)) {
+                delete callback_args;
+            }
+            // 分块开启时本分支可能已在上面插入端点忙标记，必须擦除并出队
+            // 下一笔，否则端点残留标记，后续同端点传输全被误排队
+            if (transfer_operator_->enable_chunking && !is_control) {
+                {
+                    std::lock_guard lock(active_chunked_eps_mutex_);
+                    active_chunked_eps_.erase(ep.address);
+                }
+                process_pending_urb(ep.address);
+            }
+            session->submit_ret_submit(
+                    UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum, 0));
+            return;
+        }
+        transfers_.emplace(seqnum, callback_args);
         pending_count_.fetch_add(1, std::memory_order_release);
     }
 
@@ -803,14 +888,27 @@ void usbipdcpp::Esp32DeviceHandler::decrement_chunked_and_notify() {
 void usbipdcpp::Esp32DeviceHandler::process_pending_urb(uint8_t ep_addr) {
     DeferredUrb d;
     {
+        // 锁序与 receive_urb 的忙检查一致：active_chunked_eps_mutex_ →
+        // deferred_urbs_mutex_
+        std::lock_guard alock(active_chunked_eps_mutex_);
         std::lock_guard lock(deferred_urbs_mutex_);
         auto it = deferred_urbs_.find(ep_addr);
         if (it == deferred_urbs_.end() || it->second.empty())
+            return;
+        // 端点已被其他传输占用（回调擦除标记后、本函数执行前新到达的传输
+        // 提交并接管了端点）：本笔继续排队，其完成回调会再次触发本函数。
+        // 与弹出+接管在同一锁内原子完成，防止与 receive_urb 的忙检查竞态
+        if (active_chunked_eps_.contains(ep_addr))
             return;
         d = std::move(it->second.front());
         it->second.pop();
         if (it->second.empty())
             deferred_urbs_.erase(it);
+        // 原子接管端点：active 记录本笔的 seqnum（所有权），receive_urb 的
+        // 忙检查据此识别"本笔可提交"——若不加接管，出队的 URB 会被"队列
+        // 非空"（剩项）挡回自己排到队尾，队列永不清空且无飞行传输再触发
+        // 本函数，端点永久卡死
+        active_chunked_eps_[ep_addr] = d.cmd.header.seqnum;
     }
     error_code ec;
     receive_urb(std::move(d.cmd), d.ep, d.interface, ec);
@@ -828,13 +926,15 @@ void usbipdcpp::Esp32DeviceHandler::chunked_transfer_callback(usb_transfer_t *tr
     if (handler->all_transfer_should_stop) [[unlikely]] {
         bool is_last = (--ct->pending_count == 0);
         if (is_last) {
-            // 事件线程回调，跨线程递减须走统一函数（见其注释）
-            handler->decrement_chunked_and_notify();
             cb->transfer.reset(); // 触发 free_transfer_handle，清理所有 chunk 并从 map 移除
             cb->reset();
             if (!handler->callback_args_pool_.free(cb))
                 delete cb;
-            handler->transfer_complete_cv_.notify_one();
+            // 递减放最后：本分支对 handler 的所有访问已结束。若提前递减，
+            // on_disconnection（receiver 线程）的等待立即返回，设备移除场景
+            // 下 handler 随即被销毁，本分支后续访问 handler 即 UAF
+            // （见 transfer_callback 函数末尾的完整注释）
+            handler->decrement_chunked_and_notify();
         }
         return;
     }
@@ -958,17 +1058,15 @@ void usbipdcpp::Esp32DeviceHandler::chunked_transfer_callback(usb_transfer_t *tr
         bool has_error = (static_cast<int>(ct->worst_status) == static_cast<int>(USB_TRANSFER_STATUS_STALL) ||
                           static_cast<int>(ct->worst_status) == static_cast<int>(USB_TRANSFER_STATUS_NO_DEVICE));
         int next = ct->current_chunk + 1;
-        // 持锁读 cb->unlinked：与 handle_unlink_seqnum 的写入互斥。ESP32-P4
-        // 是 RISC-V RVWMO 弱内存序，无锁读可能看到过期值（unlinked 已被
-        // 置 true 但本线程缓存未刷新），导致在 unlink 已到达的情况下仍然
-        // 提交下一个分块，违背 unlink 语义。
-        bool unlinked;
-        {
-            std::lock_guard ck_lock(handler->transfer_operator_->chunked_transfers_mutex_);
-            unlinked = cb->unlinked;
-        }
+        // unlinked 检查与提交必须在同一临界区：若先读 unlinked 再解锁提交，
+        // handle_unlink_seqnum 可能在间隙设置 unlinked 并完成 cancel（pipe 已
+        // 恢复 ACTIVE），本提交仍会进入 pipe 把数据发给设备，违背 unlink
+        // 语义。锁内提交与 handle_unlink_seqnum 的锁序一致（chunked_transfers_mutex_
+        // → endpoint_cancellation_mutex），无死锁；ESP32-P4 为 RISC-V RVWMO
+        // 弱内存序，持锁读保证看到 unlinked 的最新值
+        std::lock_guard ck_lock(handler->transfer_operator_->chunked_transfers_mutex_);
         if (!has_error && !ct->in_short && next < static_cast<int>(ct->transfers.size())
-            && (!unlinked || ct->transfer_started)) {
+            && (!cb->unlinked || ct->transfer_started)) {
             auto *next_trx = ct->transfers[next];
             if (next_trx) {
                 std::uint32_t chunk_bytes = ct->is_out ? next_trx->num_bytes : next_trx->data_buffer_size;
@@ -1054,8 +1152,7 @@ void usbipdcpp::Esp32DeviceHandler::chunked_transfer_callback(usb_transfer_t *tr
                           "Esp32DeviceHandler::chunked_transfer_callback submit_ret_submit");
             handler->session->enqueue_ret_submit(std::move(ret));
         }
-        // 事件线程回调，跨线程递减须走统一函数（见其注释）
-        handler->decrement_chunked_and_notify();
+        // 递减不在此处：必须放到本函数末尾（见函数末尾的完整注释）
     }
     // 在锁外 reset，避免 free_transfer_handle 内拿 chunked_transfers_mutex_ 死锁。
     // 先捕获 ep_address，因为 cb->transfer.reset() → free_transfer_handle 可能
@@ -1071,12 +1168,13 @@ void usbipdcpp::Esp32DeviceHandler::chunked_transfer_callback(usb_transfer_t *tr
     if (!handler->callback_args_pool_.free(cb))
         delete cb;
 
-    // 无条件通知，覆盖正常路径与 on_disconnection 的竞态。
-    // CV 谓词确保只有最后一个 callback 真正唤醒 wait。notify 是回调中对
-    // handler 的最后一次访问：on_disconnection 必须等 notify 才会返回并
-    // 销毁 handler，因此等待者被唤醒时本回调已执行完毕，不存在"计数归零
-    // 后回调继续访问已析构 handler"的窗口
-    handler->transfer_complete_cv_.notify_one();
+    // 递减必须放在本函数末尾（本函数对 handler 的最后一次访问）：
+    // 一旦计数归零并 notify，on_disconnection（receiver 线程）的等待即返回，
+    // 设备移除场景下 session 收尾会立刻销毁 handler。若提前递减，等待者
+    // 返回后本函数仍在访问 handler（wakeup_sender / process_pending_urb /
+    // callback_args_pool_），与 handler 析构并发即 UAF。放末尾保证等待者
+    // 被唤醒时本回调已执行完毕（on_disconnection 的等待见其函数内注释）
+    handler->decrement_chunked_and_notify();
 }
 
 void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
@@ -1093,16 +1191,16 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
         {
             std::unique_lock lock(handler->transfers_mutex_);
             handler->transfers_.erase(cb->seqnum);
-            // 事件线程回调，跨线程递减须走统一函数（见其注释）
-            handler->decrement_pending_and_notify();
         }
         cb->transfer.reset();
         cb->reset();
         if (!handler->callback_args_pool_.free(cb))
             delete cb;
-        // 无条件通知，覆盖与 on_disconnection 的竞态。
-        // CV 谓词确保只有最后一个 callback 真正唤醒 wait。
-        handler->transfer_complete_cv_.notify_one();
+        // 递减放最后：本分支对 handler 的所有访问已结束。若提前递减，
+        // on_disconnection（receiver 线程）的等待立即返回，设备移除场景
+        // 下 handler 随即被销毁，本分支后续访问 handler 即 UAF
+        // （见本函数末尾的完整注释）
+        handler->decrement_pending_and_notify();
         return;
     }
 
@@ -1139,8 +1237,6 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
                     if (err != ESP_OK) {
                         SPDLOG_ERROR("seqnum为{}的传输重新提交失败：{}", cb->seqnum, esp_err_to_name(err));
                         handler->transfers_.erase(cb->seqnum);
-                        // 事件线程回调，跨线程递减须走统一函数（见其注释）
-                        handler->decrement_pending_and_notify();
                         lock.unlock();
                         // 先保存端点地址再释放 trx：cb->transfer.reset() 会把
                         // trx 归还给 usb_host，之后访问 trx 任何字段都是 UAF
@@ -1162,6 +1258,8 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
                             }
                             handler->process_pending_urb(ep_addr);
                         }
+                        // 递减放最后（见本函数末尾的完整注释）
+                        handler->decrement_pending_and_notify();
                     }
                     return;
                 }
@@ -1198,10 +1296,9 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
             actual_length = iso_actual;
         }
 
-        // 原子完成：读取 unlinked、从 map 移除、递减 pending。
-        // 事件线程回调，跨线程递减须走统一函数（见其注释）
+        // 从 map 移除（与 handle_unlink_seqnum 互斥）。
+        // 递减不在此处：必须放到本函数末尾（见函数末尾的完整注释）
         handler->transfers_.erase(cb->seqnum);
-        handler->decrement_pending_and_notify();
 
         if (cb->unlinked) {
             LATENCY_TRACK_END_MSG(handler->session->latency_tracker, cb->unlink_cmd_seqnum, "被unlink");
@@ -1249,10 +1346,12 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
     if (!handler->callback_args_pool_.free(cb))
         delete cb;
 
-    // 无条件通知，覆盖正常路径与 on_disconnection 的竞态。
-    // CV 谓词确保只有最后一个 callback 真正唤醒 wait。notify 是回调中对
-    // handler 的最后一次访问：on_disconnection 必须等 notify 才会返回并
-    // 销毁 handler，因此等待者被唤醒时本回调已执行完毕，不存在"计数归零
-    // 后回调继续访问已析构 handler"的窗口
-    handler->transfer_complete_cv_.notify_one();
+    // 递减与唤醒必须放在本函数末尾（本函数对 handler 的最后一次访问）：
+    // 一旦计数归零并 notify，on_disconnection（receiver 线程）的等待即返回，
+    // 设备移除场景下 session 收尾会立刻销毁 handler（设备从 using 列表 erase）。
+    // 若提前递减，等待者返回后本函数仍在访问 handler（wakeup_sender /
+    // process_pending_urb / callback_args_pool_ / cv），与 handler 析构并发
+    // 即 UAF。放末尾保证等待者被唤醒时本回调已执行完毕；正常断连场景设备
+    // 回 available 列表、handler 存活，此顺序同样无害
+    handler->decrement_pending_and_notify();
 }

@@ -149,9 +149,15 @@ namespace usbipdcpp
         };
         std::mutex deferred_urbs_mutex_;
         std::unordered_map<uint8_t, std::queue<DeferredUrb>> deferred_urbs_;
-        // 同端点分块传输进行中标记，防止多个分块传输同时占用同一 pipe
+        // 同端点分块传输进行中标记，防止多个分块传输同时占用同一 pipe。
+        // 值为当前占用该端点传输的 seqnum（所有权标识）：process_pending_urb
+        // 弹出队头时在同一把锁内原子接管端点（记下本笔 seqnum），receive_urb
+        // 据此区分"本笔刚从队列出队（active 属于自己，可提交）"与"新到达的
+        // 传输（active 被他人占用，入队）"——若用 set 无法区分这两者，出队的
+        // URB 会被"队列非空"挡回自己排到队尾，无飞行传输再触发后续出队，
+        // 端点永久卡死
         std::mutex active_chunked_eps_mutex_;
-        std::set<uint8_t> active_chunked_eps_;
+        std::unordered_map<uint8_t, std::uint32_t> active_chunked_eps_;
         // 提交分块传输的第一个 chunk（从 receive_urb 或 deferred 出队后调用）。
         // 返回 ESP_OK 表示已入 pipe（可能在飞行或已完成），错误表示未进入 pipe
         esp_err_t submit_first_chunk(ChunkedTransfer* ct, esp32_callback_args* cb,
