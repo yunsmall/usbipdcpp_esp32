@@ -141,8 +141,10 @@ void* Esp32TransferOperator::alloc_transfer_handle(std::size_t buffer_length, in
         // 控制传输：需要在 buffer 开头留出 setup packet 空间
         actual_buffer_length = USB_SETUP_PACKET_SIZE + buffer_length;
     }
-    else if (is_in && buffer_length > 0) {
-        // Bulk/Interrupt IN 传输：需要对齐到 MPS
+    else if (is_in && buffer_length > 0 && num_iso_packets == 0) {
+        // Bulk/Interrupt IN 传输：需要对齐到 MPS。ISO 跳过：usbh 的
+        // transfer_check_usb_compliance 要求 ISO 的 num_bytes 精确等于各包
+        // num_bytes 之和，对齐会致提交失败（依据 ESP-IDF v5.5 usbh.c）
         auto it = endpoint_mps_map_.find(static_cast<std::uint8_t>(header.ep | 0x80));
         if (it != endpoint_mps_map_.end() && it->second > 0) {
             std::uint16_t mps = it->second;

@@ -436,7 +436,11 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
     }
     else {
         num_bytes = transfer_buffer_length;
-        if (!is_out && ep.max_packet_size > 0) {
+        // ISO 跳过 MPS 对齐：usbh 的 transfer_check_usb_compliance 要求 ISO
+        // 的 num_bytes 精确等于各包 num_bytes 之和（依据 ESP-IDF v5.5
+        // usbh.c），对齐会使提交失败（ESP_ERR_INVALID_ARG）
+        if (!is_out && ep.max_packet_size > 0
+            && ep.attributes != static_cast<std::uint8_t>(EndpointAttributes::Isochronous)) {
             std::uint32_t mps = ep.max_packet_size;
             if (num_bytes % mps != 0) {
                 if (ep.attributes == static_cast<std::uint8_t>(EndpointAttributes::Bulk))
@@ -565,6 +569,10 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
                      ep.attributes == static_cast<std::uint8_t>(EndpointAttributes::Interrupt) ? "intr" : "iso",
                      is_out ? "out" : "in",
                      esp_err_to_name(err));
+        // 提交失败路径无需检查 cb->unlinked 改发 RET_UNLINK：receive_urb 与
+        // handle_unlink_seqnum 同在 Session receiver 线程串行执行（Session.cpp
+        // 的接收循环），CMD_UNLINK 不可能在本路径执行中途置位；unlink 先到时
+        // seqnum 尚未注册进 transfers_，handle_unlink 会发 RET_UNLINK(0) 兜底
         {
             std::unique_lock lock(transfers_mutex_);
             transfers_.erase(seqnum);
@@ -598,6 +606,10 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
 }
 
 void usbipdcpp::Esp32DeviceHandler::cancel_all_transfer() {
+    // usb_parse_interface_descriptor 的第二参数是接口在配置描述符中的索引
+    // （合法用法），此函数只用于定位端点描述符并取消端点
+    // （cancel_endpoint_all_transfers 按端点地址操作），不涉及
+    // claim/release 的 bInterfaceNumber 语义
     const usb_config_desc_t *config_desc;
     ESP_ERROR_CHECK(usb_host_get_active_config_descriptor(native_handle, &config_desc));
     const usb_intf_desc_t *intf = NULL;
