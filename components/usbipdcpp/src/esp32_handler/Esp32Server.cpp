@@ -51,9 +51,42 @@ void usbipdcpp::Esp32Server::client_event_callback(const usb_host_client_event_m
             // usbh.c），设备地址全局递增不复用，同一 address 不会重复出现，
             // 无需重复绑定检查（防御性检查无触发场景）
             this_server->host_devices[event_msg->new_dev.address] = dev_handle;
-            auto bind_ret = this_server->bind_host_device(dev_handle);
+            // 回滚绑定中途失败（如 OOM 异常）的接口与句柄：接口可能已部分
+            // claim、句柄未关闭。先 release 全部接口再 close——usb_host_device_close
+            // 对仍有 claim 接口的设备返回 ESP_ERR_INVALID_STATE，必须先释放
+            auto rollback_bind = [&]() {
+                const usb_config_desc_t *cfg = nullptr;
+                if (usb_host_get_active_config_descriptor(dev_handle, &cfg) == ESP_OK && cfg) {
+                    for (int intf_i = 0; intf_i < cfg->bNumInterfaces; intf_i++) {
+                        int intf_offset;
+                        auto intf_desc = usb_parse_interface_descriptor(cfg, intf_i, 0, &intf_offset);
+                        if (!intf_desc)
+                            continue;
+                        usb_host_interface_release(this_server->host_client_handle, dev_handle,
+                                                   intf_desc->bInterfaceNumber);
+                    }
+                }
+                usb_host_device_close(this_server->host_client_handle, dev_handle);
+            };
+            esp_err_t bind_ret;
+            try {
+                bind_ret = this_server->bind_host_device(dev_handle);
+            }
+            catch (const std::exception &e) {
+                // C 回调边界：异常逃逸到 usbh（C 代码）是未定义行为，必须
+                // 就地消化。bind 内部只在错误路径 close 句柄，异常路径由
+                // 上方 rollback 补齐
+                SPDLOG_ERROR("绑定设备时异常：{}", e.what());
+                rollback_bind();
+                bind_ret = ESP_FAIL;
+            }
+            catch (...) {
+                SPDLOG_ERROR("绑定设备时未知异常");
+                rollback_bind();
+                bind_ret = ESP_FAIL;
+            }
             if (bind_ret != ESP_OK) {
-                // 绑定失败：句柄已在 bind_host_device 内关闭，从 map 移除，
+                // 绑定失败（含异常回滚路径）：句柄已关闭，从 map 移除，
                 // 防止设备拔除时 remove_gone_device 对已关闭句柄误操作
                 this_server->host_devices.erase(event_msg->new_dev.address);
             }
@@ -191,12 +224,18 @@ esp_err_t usbipdcpp::Esp32Server::bind_host_device(usb_device_handle_t dev) {
                 );
     }
 
+    // 生成并打印 busid：设备插入时直接输出，省去客户端先 usbip list 查。
+    // bind 时设备活着，构建端口拓扑 busid 安全（见 tools.h 注释）
+    auto busid = esp32_get_device_busid(dev);
+    SPDLOG_INFO("新设备 busid={} VID:PID={:04x}:{:04x}", busid,
+                device_descriptor->idVendor, device_descriptor->idProduct);
+
     {
         std::lock_guard lock(server.get_devices_mutex());
         auto &server_available_devices = server.get_available_devices();
         auto current_device = std::make_shared<UsbDevice>(UsbDevice{
                 .path = std::format("/esp32/usbipdcpp/{}/{}", 1, dev_info.dev_addr),
-                .busid = esp32_get_device_busid(dev_info.dev_addr),
+                .busid = busid,
                 .bus_num = 1,
                 .dev_num = dev_info.dev_addr,
                 .speed = static_cast<std::uint32_t>(esp32_speed_to_usb_speed(dev_info.speed)),
@@ -226,7 +265,6 @@ void usbipdcpp::Esp32Server::unbind_host_device(usb_device_handle_t dev) {
         spdlog::error("无法获取设备信息：{}", esp_err_to_name(err));
         return;
     }
-    auto taregt_busid = esp32_get_device_busid(dev_info.dev_addr);
     {
         // 锁序先 all_host_devices_mutex 再 devices_mutex，与 stop() /
         // client_event_callback / remove_gone_device 保持一致，反向获取
@@ -237,27 +275,27 @@ void usbipdcpp::Esp32Server::unbind_host_device(usb_device_handle_t dev) {
         std::unique_lock lock(server.get_devices_mutex());
         auto &server_available_devices = server.get_available_devices();
         for (auto i = server_available_devices.begin(); i != server_available_devices.end(); ++i) {
-            if ((*i)->busid == taregt_busid) {
+            // 按 native_handle 匹配而非重建 busid：busid 是端口拓扑字符串，
+            // 设备存活时直接用对象里 bind 时缓存的副本
+            if (auto esp32_handler = std::dynamic_pointer_cast<Esp32DeviceHandler>((*i)->handler);
+                esp32_handler && esp32_handler->native_handle == dev) {
 
-                auto esp32_device_handler = std::dynamic_pointer_cast<Esp32DeviceHandler>((*i)->handler);
-                if (esp32_device_handler) {
-                    const usb_config_desc_t *active_config_desc = nullptr;
-                    err = usb_host_get_active_config_descriptor(dev, &active_config_desc);
+                const usb_config_desc_t *active_config_desc = nullptr;
+                err = usb_host_get_active_config_descriptor(dev, &active_config_desc);
+                if (err != ESP_OK) {
+                    SPDLOG_ERROR("无法获取设备活动配置描述符：{}", esp_err_to_name(err));
+                    return;
+                }
+                for (int intf_i = 0; intf_i < active_config_desc->bNumInterfaces; intf_i++) {
+                    int intf_offset;
+                    auto intf_desc = usb_parse_interface_descriptor(active_config_desc, intf_i, 0, &intf_offset);
+                    if (!intf_desc)
+                        continue;
+                    // release 的第三参数是 bInterfaceNumber（接口号），
+                    // 跳号接口用数组下标会释放错误的接口
+                    err = usb_host_interface_release(host_client_handle, dev, intf_desc->bInterfaceNumber);
                     if (err != ESP_OK) {
-                        SPDLOG_ERROR("无法获取设备活动配置描述符：{}", esp_err_to_name(err));
-                        return;
-                    }
-                    for (int intf_i = 0; intf_i < active_config_desc->bNumInterfaces; intf_i++) {
-                        int intf_offset;
-                        auto intf_desc = usb_parse_interface_descriptor(active_config_desc, intf_i, 0, &intf_offset);
-                        if (!intf_desc)
-                            continue;
-                        // release 的第三参数是 bInterfaceNumber（接口号），
-                        // 跳号接口用数组下标会释放错误的接口
-                        err = usb_host_interface_release(host_client_handle, dev, intf_desc->bInterfaceNumber);
-                        if (err != ESP_OK) {
-                            SPDLOG_ERROR("释放接口{}时出错: {}", intf_desc->bInterfaceNumber, esp_err_to_name(err));
-                        }
+                        SPDLOG_ERROR("释放接口{}时出错: {}", intf_desc->bInterfaceNumber, esp_err_to_name(err));
                     }
                 }
                 server_available_devices.erase(i);
@@ -276,8 +314,13 @@ void usbipdcpp::Esp32Server::unbind_host_device(usb_device_handle_t dev) {
         }
         SPDLOG_WARN("可使用的设备中无目标设备");
 
-        if (server.get_using_devices().contains(taregt_busid)) {
-            SPDLOG_WARN("正在使用的设备不支持解绑");
+        auto &server_using_devices = server.get_using_devices();
+        for (auto &[busid, device]: server_using_devices) {
+            if (auto esp32_handler = std::dynamic_pointer_cast<Esp32DeviceHandler>(device->handler);
+                esp32_handler && esp32_handler->native_handle == dev) {
+                SPDLOG_WARN("正在使用的设备不支持解绑: {}", busid);
+                return;
+            }
         }
     }
 }
@@ -489,12 +532,15 @@ void usbipdcpp::Esp32Server::remove_gone_device(usb_device_handle_t dev) {
         auto address = find_ret->first;
         host_devices.erase(find_ret);
         SPDLOG_TRACE("成功从所有设备中移除拔除的设备");
-        auto target_busid = esp32_get_device_busid(address);
-
+        // busid 是 bind 时缓存在 UsbDevice 里的端口拓扑字符串（见 tools.h
+        // esp32_get_device_busid）。设备已移除，不能按 handle 重建 busid（父
+        // 设备 device_t 可能已释放，递归访问是 UAF），改为按 native_handle
+        // 直接匹配对象，busid 无需在移除路径重新生成
         std::lock_guard lock2(server.get_devices_mutex());
         auto &server_available_devices = server.get_available_devices();
         for (auto i = server_available_devices.begin(); i != server_available_devices.end(); ++i) {
-            if ((*i)->busid == target_busid) {
+            if (auto esp32_handler = std::dynamic_pointer_cast<Esp32DeviceHandler>((*i)->handler);
+                esp32_handler && esp32_handler->native_handle == dev) {
                 // 此处可以删除设备，因为此时因其还处于可用设备，因此没有session正在处理这个设备
                 server_available_devices.erase(i);
                 spdlog::info("从可用设备中移除目标设备");
@@ -504,14 +550,13 @@ void usbipdcpp::Esp32Server::remove_gone_device(usb_device_handle_t dev) {
         SPDLOG_WARN("可使用的设备中无目标设备");
         auto &server_using_devices = server.get_using_devices();
         for (auto i = server_using_devices.begin(); i != server_using_devices.end(); ++i) {
-            if (i->first == target_busid) {
-                if (auto handler = i->second->handler) {
-                    // 通过 AbstDeviceHandler 接口通知
-                    handler->on_device_removed();
-                    // 强制关闭 Session
-                    SPDLOG_WARN("正在使用的设备被拔出，强制关闭 Session: {}", target_busid);
-                    handler->trigger_session_stop();
-                }
+            if (auto esp32_handler = std::dynamic_pointer_cast<Esp32DeviceHandler>(i->second->handler);
+                esp32_handler && esp32_handler->native_handle == dev) {
+                // 通过 AbstDeviceHandler 接口通知
+                esp32_handler->on_device_removed();
+                // 强制关闭 Session
+                SPDLOG_WARN("正在使用的设备被拔出，强制关闭 Session: {}", i->first);
+                esp32_handler->trigger_session_stop();
                 return;
             }
         }
