@@ -244,7 +244,7 @@ void usbipdcpp::Esp32Server::unbind_host_device(usb_device_handle_t dev) {
     }
 }
 
-void usbipdcpp::Esp32Server::start(asio::ip::tcp::endpoint &ep) {
+usbipdcpp::error_code usbipdcpp::Esp32Server::start(asio::ip::tcp::endpoint &ep) {
     // 设置线程栈，减少内存占用。加锁防止多线程并发修改全局 pthread 配置
     server.set_before_thread_create_callback([this](ThreadPurpose purpose) {
         thread_cfg_mutex.lock();
@@ -272,7 +272,12 @@ void usbipdcpp::Esp32Server::start(asio::ip::tcp::endpoint &ep) {
         thread_cfg_mutex.unlock();
     });
 
-    server.start(ep);
+    // Server::start 不抛异常，错误通过返回值报告（便于无异常环境的嵌入式平台）
+    auto ec = server.start(ep);
+    if (ec) [[unlikely]] {
+        // 启动失败（如端口被占）：无需创建 client 事件线程，直接返回错误码
+        return ec;
+    }
 
     {
         // RAII 持锁：std::thread 构造抛异常（资源不足）时锁自动释放，不会
@@ -283,31 +288,44 @@ void usbipdcpp::Esp32Server::start(asio::ip::tcp::endpoint &ep) {
         pthread_cfg.thread_name = "Esp32Server client_event_thread";
         pthread_cfg.stack_size = 5120;
         esp_pthread_set_cfg(&pthread_cfg);
-    client_event_thread = std::thread([this]() {
         try {
-            SPDLOG_INFO("启动一个client event handle的事件循环线程");
-            while (!should_exit_client_event_thread) {
-                auto ret = usb_host_client_handle_events(host_client_handle,pdMS_TO_TICKS(10000));
-                if (ret == ESP_OK) [[likely]]
-                        continue;
-                else if (ret == ESP_ERR_TIMEOUT) {
-                    // SPDLOG_WARN("usb_host_client_handle_events timeout");
-                    continue;
+            client_event_thread = std::thread([this]() {
+                try {
+                    SPDLOG_INFO("启动一个client event handle的事件循环线程");
+                    while (!should_exit_client_event_thread) {
+                        auto ret = usb_host_client_handle_events(host_client_handle,pdMS_TO_TICKS(10000));
+                        if (ret == ESP_OK) [[likely]]
+                                continue;
+                        else if (ret == ESP_ERR_TIMEOUT) {
+                            // SPDLOG_WARN("usb_host_client_handle_events timeout");
+                            continue;
+                        }
+                        else [[unlikely]] {
+                            SPDLOG_ERROR("usb_host_client_handle_events发生错误：{}", esp_err_to_name(ret));
+                            break;
+                        }
+                    }
+                    SPDLOG_TRACE("退出client event事件循环");
+                } catch (const std::exception &e) {
+                    SPDLOG_ERROR("An unexpected exception occurs in client event handle thread: {}", e.what());
+                    std::exit(1);
                 }
-                else [[unlikely]] {
-                    SPDLOG_ERROR("usb_host_client_handle_events发生错误：{}", esp_err_to_name(ret));
-                    break;
-                }
-            }
-            SPDLOG_TRACE("退出client event事件循环");
-        } catch (const std::exception &e) {
-            SPDLOG_ERROR("An unexpected exception occurs in client event handle thread: {}", e.what());
-            std::exit(1);
+            });
         }
-    });
+        catch (const std::system_error &e) {
+            // 线程创建失败（资源不足）：start 承诺不抛异常，错误通过返回值
+            // 报告（与 LibusbServer::start 一致）。调用方按失败处理不再调
+            // stop()，这里必须回滚已启动的 server，否则监听端口泄漏。
+            // 锁由 RAII 释放；pthread 配置残留无影响（before/after 回调会
+            // 为后续线程重新设置）
+            SPDLOG_ERROR("创建 client event 线程失败：{}", e.what());
+            server.stop();
+            return std::make_error_code(std::errc::resource_unavailable_try_again);
+        }
         esp_pthread_cfg_t default_cfg = esp_pthread_get_default_config();
         esp_pthread_set_cfg(&default_cfg);
     }
+    return ec;
 }
 
 void usbipdcpp::Esp32Server::stop() {
@@ -317,10 +335,14 @@ void usbipdcpp::Esp32Server::stop() {
     // 中执行）可能与下方的 usb_host_interface_release 并发，同一接口释放
     // 两次或操作已关闭的句柄
     should_exit_client_event_thread = true;
-    usb_host_client_unblock(host_client_handle);
-    spdlog::info("等待client handle事件线程结束");
-    client_event_thread.join();
-    spdlog::info("client handle事件线程结束");
+    if (client_event_thread.joinable()) {
+        // joinable 检查：start 中 std::thread 构造失败时线程不存在（直接
+        // join 抛 std::system_error），或线程已提前退出，两种情况都跳过
+        usb_host_client_unblock(host_client_handle);
+        spdlog::info("等待client handle事件线程结束");
+        client_event_thread.join();
+        spdlog::info("client handle事件线程结束");
+    }
 
     {
         // 先取 all_host_devices_mutex 再取 devices_mutex，与 client_event_callback
