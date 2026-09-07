@@ -20,6 +20,8 @@ English | [中文](README-zh.md)
 - 🌐 **Multi-device Support** - USB hubs supported, multiple devices can be exported simultaneously
 - ⚡ **Zero-Copy Performance** - Direct DMA buffer access eliminates data copying overhead, achieving optimal throughput
 - 🛡️ **Robust Connection Handling** - Automatic cleanup when devices are unplugged during active sessions
+- 🖥️ **Runtime WiFi Configuration** - Change WiFi over a web UI or a dedicated serial console; credentials persist in NVS across reboots — no recompilation needed
+- 📊 **Device Status Panel** - Web UI and serial console list attached devices (busid, VID:PID, remote-client usage)
 
 ## 📋 Requirements
 
@@ -49,17 +51,19 @@ git clone --recursive https://github.com/yunsmall/usbipdcpp_esp32.git
 cd usbipdcpp_esp32
 ```
 
-### 2. Configure WiFi
+### 2. Configure WiFi (Optional)
 
-Set your WiFi credentials via menuconfig:
+The checked-in per-target configs (`sdkconfig.defaults.esp32s3` / `esp32p4`) intentionally contain **no** WiFi credentials — a fresh build boots without network. Provide credentials one of two ways:
+
+**Option A — compile-time default (connects on first boot):**
 
 ```bash
 idf.py menuconfig
 ```
 
-Navigate to `Usbipdcpp WiFi Configuration` and set:
-- `Usbipd WiFi SSID`
-- `Usbipd WiFi Password`
+Navigate to `Usbipdcpp WiFi Configuration` and set `Usbipd WiFi SSID` / `Usbipd WiFi Password`.
+
+**Option B — configure at runtime after flashing** via the web UI or the dedicated serial console (no recompile needed, credentials persist in NVS across reboots). See the *Management & Configuration* section below.
 
 ### 3. Build and Flash
 
@@ -93,6 +97,45 @@ sudo usbip list -r <ESP32_IP>
 # Attach to a device
 sudo usbip attach -r <ESP32_IP> -b <BUSID>
 ```
+
+## 🖥️ Management & Configuration
+
+WiFi and device status are manageable at runtime. WiFi credentials are stored in NVS (namespace `wifi`) and applied automatically on every boot — recompiling to switch networks is never required.
+
+### Web UI (when online)
+
+Open `http://<ESP32_IP>/` in a browser (HTTP port 80):
+
+- **USB devices card** — attached devices with `busid`, `VID:PID` and usage state (idle / in use by a remote client). Auto-refreshes every 5 seconds.
+- **WiFi card** (collapsed by default) — current SSID/IP, change credentials (the device disconnects and reconnects to the new AP), plus a wiring hint for the fallback serial console. Empty password = open network.
+
+REST API: `GET /api/status` (connection state + config-port GPIOs), `GET /api/devices` (device list), `POST /api/wifi` (form-urlencoded `ssid=..&password=..`).
+
+### Serial Console (when offline / misconfigured WiFi)
+
+If the network is unreachable, configure through the **dedicated config UART** — the pins differ per chip (Kconfig: `USBIPD_CFG_UART_TX_GPIO` / `USBIPD_CFG_UART_RX_GPIO`):
+
+| Chip       | Config UART TX | Config UART RX |
+|------------|----------------|----------------|
+| ESP32-S3   | GPIO17         | GPIO18         |
+| ESP32-P4   | GPIO4          | GPIO5          |
+
+Wire a USB-UART adapter **crossed**: adapter RX → device TX, adapter TX → device RX, GND common. Open the terminal at 115200 8N1 and use the built-in commands (`help` lists all):
+
+| Command | Purpose |
+|---------|---------|
+| `wifi_set <ssid> [password]` | Set WiFi and reconnect (saved to NVS; omit password for an open network) |
+| `wifi_show` / `wifi_reset` | Show current config / clear NVS back to compile-time defaults |
+| `devices` | List attached USB devices (busid / VID:PID / usage state) |
+| `mem` | Print heap usage |
+| `logs` | Mirror the main UART0 log stream to the config port (Ctrl-C to stop) |
+| `about` | What this firmware is and how to manage it |
+
+The mirrored log stream is written with `\r\n` line endings so it renders correctly on real serial terminals.
+
+### Local Web Preview (no flashing)
+
+The web UI is a single static file (`main/web/index.html`) embedded at compile time. To iterate on layout/scripts without flashing the firmware: run `python main/web/mock_server.py` and open `http://127.0.0.1:8000`. The mock serves fake `/api/status` and `/api/devices` responses; edit the top of the script to preview different states (disconnected, disabled config port, long SSID…).
 
 ## 🏗️ Architecture
 
@@ -137,7 +180,7 @@ sudo usbip attach -r <ESP32_IP> -b <BUSID>
 
 ## ⚡ Performance Optimization
 
-This implementation leverages usbipdcpp v1.0.1's zero-copy architecture for maximum throughput:
+This implementation leverages usbipdcpp's zero-copy architecture for maximum throughput:
 
 - **Direct DMA Buffer Access**: USB transfer buffers are allocated in DMA-capable memory and accessed directly for network I/O, eliminating intermediate data copies
 - **RAII Transfer Management**: `TransferHandle` automatically manages buffer lifecycle, ensuring proper cleanup without manual memory management
