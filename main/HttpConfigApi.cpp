@@ -1,12 +1,15 @@
 #include "HttpConfigApi.h"
 
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 
 #include <esp_log.h>
+#include <esp_wifi.h>
 
 #include "esp32_handler/Esp32Server.h"
 #include "WifiConfigManager.h"
@@ -183,16 +186,27 @@ esp_err_t HttpConfigApi::handle_post_wifi(httpd_req_t *req)
     }
     form_value(body, "password", password); // 缺失/空 = 开放 AP
 
-    auto &manager = WifiConfigManager::instance();
-    esp_err_t err = manager.apply_config(ssid, password);
-    if (err != ESP_OK) {
-        char error[96];
-        std::snprintf(error, sizeof(error), "{\"error\":\"%s\"}", esp_err_to_name(err));
-        return send_json(req, 400, error);
+    // 参数预检（与 WifiConfigManager::apply_config 相同的长度规则）：必须保证
+    // 下方 200 应答之后的应用必然通过校验——先应答后断网是页面"有反应"的关键
+    if (ssid.size() >= MAX_SSID_LEN || password.size() >= MAX_PASSPHRASE_LEN) {
+        return send_json(req, 400, "{\"error\":\"ssid/password too long\"}");
     }
 
-    // 应用后当前连接会被断开重连，返回成功提示即可
-    return send_json(req, 200, "{\"result\":\"ok, reconnecting\"}");
+    auto &manager = WifiConfigManager::instance();
+    // 先应答、再断网：apply_config 会断开当前 WiFi 重连新 AP，若先改配置再
+    // 发响应，响应恰在断网瞬间丢在半路，浏览器 fetch 永远等不到结果——设备
+    // 其实已重连，页面却"点了没反应"。应答后稍等片刻让响应字节真正发出，
+    // 然后才断开当前连接
+    esp_err_t resp_ret = send_json(req, 200, "{\"result\":\"ok, reconnecting\"}");
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    esp_err_t err = manager.apply_config(ssid, password);
+    if (err != ESP_OK) {
+        // 响应已发出无法改状态码，只能记日志（长度已预检，余下为 NVS/资源
+        // 性错误）；连接若没断成，重连线程/页面状态后续会如实反映
+        ESP_LOGE(TAG, "应用 WiFi 配置失败: %s", esp_err_to_name(err));
+    }
+    return resp_ret;
 }
 
 esp_err_t HttpConfigApi::init()
