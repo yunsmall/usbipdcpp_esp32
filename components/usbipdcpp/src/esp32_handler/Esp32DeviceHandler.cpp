@@ -35,8 +35,8 @@ void log_heap_diag(const char *tag) {
 
 } // anonymous namespace
 
-void usbipdcpp::Esp32DeviceHandler::on_new_connection(Session &current_session, error_code &ec) {
-    AbstDeviceHandler::on_new_connection(current_session, ec);
+void usbipdcpp::Esp32DeviceHandler::on_new_connection(TransferResponder &responder, error_code &ec) {
+    AbstDeviceHandler::on_new_connection(responder, ec);
     all_transfer_should_stop = false;
     device_removed_ = false;
     log_heap_diag(TAG);
@@ -145,7 +145,7 @@ void usbipdcpp::Esp32DeviceHandler::handle_unlink_seqnum(std::uint32_t unlink_se
         // 不在任何表中——传输已完成（回调已发 RET_SUBMIT 或 RET_UNLINK）。
         // 此时 CMD_UNLINK 已无意义，直接同步发 RET_UNLINK(0)。
         SPDLOG_DEBUG("transfer {} 已不在传输表中，立即发送 ret_unlink {}", unlink_seqnum, cmd_seqnum);
-        session->submit_ret_unlink(
+        responder->submit_ret_unlink(
                 UsbIpResponse::UsbIpRetUnlink::create_ret_unlink(cmd_seqnum, 0));
     }
 }
@@ -177,13 +177,13 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
             // 不支持、clear_halt 失败），不能回复成功——客户端会误以为操作
             // 已生效，按 EPIPE 回复让客户端感知失败
             if (tweak_ret == 0) {
-                session->submit_ret_submit(
+                responder->submit_ret_submit(
                         UsbIpResponse::UsbIpRetSubmit::create_ret_submit_ok_without_data(seqnum, transfer_buffer_length));
             }
             else {
                 SPDLOG_ERROR("tweak 特殊控制请求失败：seqnum={}, err={}", seqnum,
                              esp_err_to_name(static_cast<esp_err_t>(tweak_ret)));
-                session->submit_ret_submit(
+                responder->submit_ret_submit(
                         UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum, 0));
             }
             return;
@@ -312,7 +312,7 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
             if (!callback_args_pool_.free(callback_args)) {
                 delete callback_args;
             }
-            session->submit_ret_submit(
+            responder->submit_ret_submit(
                     UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum, 0));
             return;
         }
@@ -325,7 +325,7 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
                  ep.attributes == static_cast<std::uint8_t>(EndpointAttributes::Bulk) ? "bulk" :
                  ep.attributes == static_cast<std::uint8_t>(EndpointAttributes::Interrupt) ? "intr" : "iso",
                  is_out ? "out" : "in");
-    LATENCY_TRACK(session->latency_tracker, seqnum,
+    LATENCY_TRACK(*responder->latency_tracker(), seqnum,
                   "Esp32DeviceHandler::receive_urb submit");
     esp_err_t err;
     if (is_control)
@@ -362,7 +362,7 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
             device_removed_ = true;
             ec = make_error_code(ErrorType::NO_DEVICE);
         }
-        session->submit_ret_submit(
+        responder->submit_ret_submit(
                 UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum, 0));
     }
 }
@@ -628,7 +628,7 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
 
     SPDLOG_DEBUG("callback seqnum={} status={} actual={}", cb->seqnum,
                  static_cast<int>(trx->status), trx->actual_num_bytes);
-    LATENCY_TRACK(handler->session->latency_tracker, cb->seqnum,
+    LATENCY_TRACK(*handler->responder->latency_tracker(), cb->seqnum,
                   "Esp32DeviceHandler::transfer_callback调用");
 
     // 如果断连了，直接清理并返回（不发送响应）
@@ -713,7 +713,7 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
                         SPDLOG_ERROR("seqnum为{}的传输重新提交失败：{}", cb->seqnum, esp_err_to_name(err));
                         handler->transfers_.erase(cb->seqnum);
                         lock.unlock();
-                        handler->session->submit_ret_submit(
+                        handler->responder->submit_ret_submit(
                                 UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(cb->seqnum, 0));
                         cb->transfer.reset();
                         cb->reset();
@@ -772,8 +772,8 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
         handler->transfers_.erase(cb->seqnum);
 
         if (cb->unlinked) {
-            LATENCY_TRACK_END_MSG(handler->session->latency_tracker, cb->unlink_cmd_seqnum, "被unlink");
-            handler->session->enqueue_ret_unlink(
+            LATENCY_TRACK_END_MSG(*handler->responder->latency_tracker(), cb->unlink_cmd_seqnum, "被unlink");
+            handler->responder->enqueue_ret_unlink(
                     UsbIpResponse::UsbIpRetUnlink::create_ret_unlink(
                             cb->unlink_cmd_seqnum, trxstat2error(trx->status)));
             cb->transfer.reset();
@@ -804,12 +804,12 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
             }
             ret.error_count = error_count;
             SPDLOG_DEBUG("esp32传输actual_length为{}个字节", actual_length);
-            LATENCY_TRACK(handler->session->latency_tracker, cb->seqnum,
+            LATENCY_TRACK(*handler->responder->latency_tracker(), cb->seqnum,
                           "Esp32DeviceHandler::transfer_callback submit_ret_submit");
-            handler->session->enqueue_ret_submit(std::move(ret));
+            handler->responder->enqueue_ret_submit(std::move(ret));
         }
     }
-    handler->session->wakeup_sender();
+    handler->responder->wakeup_sender();
 
     cb->reset();
     if (!handler->callback_args_pool_.free(cb))

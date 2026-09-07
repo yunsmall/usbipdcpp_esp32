@@ -70,6 +70,13 @@ void* Esp32TransferOperator::alloc_transfer_handle(std::size_t buffer_length, in
         log_heap_diag(TAG);
         return nullptr;
     }
+    // 按 CMD_SUBMIT header 落库端点地址（ep 号 | 方向位，header.ep 已由协议层
+    // 校验 ≤ 0x7F）：协议解析阶段（from_socket → recv_transfer_data）早于
+    // receive_urb 设置 bEndpointAddress，而 usb_host_transfer_alloc 清零分配
+    // （urb_alloc 用 calloc），此刻不写地址则 recv 无法区分控制/非控制传输。
+    // receive_urb 提交前会按解析出的真实端点覆盖此值（两者正常情况下一致，
+    // 客户端方向与端点矛盾时以真实端点为准，方向判断只影响线上数据收发）
+    transfer->bEndpointAddress = static_cast<std::uint8_t>(header.ep) | (is_in ? 0x80 : 0);
     return transfer;
 }
 
@@ -77,6 +84,16 @@ std::size_t Esp32TransferOperator::get_actual_length(void* transfer_handle)
 {
     auto* trx = static_cast<usb_transfer_t*>(transfer_handle);
     return trx->actual_num_bytes;
+}
+
+bool Esp32TransferOperator::transfer_is_in(void* transfer_handle)
+{
+    auto* trx = static_cast<usb_transfer_t*>(transfer_handle);
+    // 方向以端点地址的方向位为准。地址在 alloc_transfer_handle 时按 CMD_SUBMIT
+    // 的 direction 落库，传输回调前 receive_urb 又按解析出的真实端点覆盖，
+    // 因此查询时刻（RET_SUBMIT::to_socket，回调已执行）读到的必是真实方向。
+    // 协议层按它决定回发长度：IN 回发 actual_length，OUT 恒 0（OUT 数据不回发）
+    return (trx->bEndpointAddress & 0x80) != 0;
 }
 
 usbipdcpp::UsbIpIsoPacketDescriptor
@@ -123,9 +140,11 @@ void Esp32TransferOperator::send_transfer_data(void* handle, asio::ip::tcp::sock
         // CMD_SUBMIT 的描述符 length 决定），同时用于数据读取和描述符 offset 字段。
         // 只对 IN 方向发送数据：与内核 stub_tx.c 一致（ISO 的 transfer buffer
         // 分支全部要求 usb_pipein），vhci 侧对 OUT 传输也不读数据；OUT 方向只发
-        // 描述符。vhci 按 header 的 number_of_packets 读取描述符，不发会错位
-        bool is_in = (trx->bEndpointAddress & 0x80) != 0;
-        bool need_to_send_buffer = is_in && (length > 0);
+        // 描述符。vhci 按 header 的 number_of_packets 读取描述符，不发会错位。
+        // length 已由协议层按方向算好（transfer_is_in 查询，OUT 恒传 0，
+        // 见 RET_SUBMIT::to_socket），这里只按 length > 0 决定是否发数据，
+        // 不再自行判断方向
+        bool need_to_send_buffer = (length > 0);
         std::uint32_t offset = 0;
         SmallVector<asio::const_buffer, 130> buffers;
         SmallVector<decltype(UsbIpIsoPacketDescriptor{}.to_bytes()), 130> desc_bytes;
@@ -147,8 +166,10 @@ void Esp32TransferOperator::send_transfer_data(void* handle, asio::ip::tcp::sock
         }
         asio::write(sock, buffers, ec);
     }
-    else {
-        // 控制传输使用端点 0（地址 0x00 或 0x80），需要跳过 setup 包
+    else if (length > 0) {
+        // 控制传输使用端点 0（地址 0x00 或 0x80），需要跳过 setup 包。
+        // 本函数在传输回调（receive_urb 已设置 bEndpointAddress）之后调用，
+        // 端点地址此时必已填好，可直接按它判断
         auto offset = ((trx->bEndpointAddress & 0x7F) == 0) ? USB_SETUP_PACKET_SIZE : 0;
         asio::write(sock, asio::buffer(reinterpret_cast<const char*>(trx->data_buffer) + offset, length), ec);
     }
@@ -159,7 +180,12 @@ void Esp32TransferOperator::recv_transfer_data(void* handle, asio::ip::tcp::sock
                                                std::error_code& ec)
 {
     auto* trx = static_cast<usb_transfer_t*>(handle);
-    // 控制传输使用端点 0（地址 0x00 或 0x80），需要跳过 setup 包
+    // 控制传输 buffer 前 8 字节留给 setup 包（alloc 时多分配了
+    // USB_SETUP_PACKET_SIZE），由后续 receive_urb 填入；此处从偏移 8 开始
+    // 读取数据阶段内容。bEndpointAddress 已由 alloc_transfer_handle 按
+    // CMD_SUBMIT header 的 ep+direction 落库（见该函数注释），可据此判断
+    // 是否控制传输（recv 自身无法用其他字段推断：usbh 提交前不设置任何
+    // 传输类型/端点信息，transfer 结构由 calloc 清零分配）
     auto offset = ((trx->bEndpointAddress & 0x7F) == 0) ? USB_SETUP_PACKET_SIZE : 0;
     asio::read(sock, asio::buffer(static_cast<std::uint8_t*>(trx->data_buffer) + offset, length), ec);
     if (ec)

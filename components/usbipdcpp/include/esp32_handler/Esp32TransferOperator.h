@@ -39,6 +39,7 @@ public:
                                 const UsbIpHeaderBasic& header, const SetupPacket& setup_packet) override;
     void free_transfer_handle(void* handle) override;
     std::size_t get_actual_length(void* handle) override;
+    bool transfer_is_in(void* handle) override;
     UsbIpIsoPacketDescriptor get_iso_descriptor(void* handle, int index) override;
     void set_iso_descriptor(void* handle, int index, const UsbIpIsoPacketDescriptor& desc) override;
     void send_transfer_data(void* handle, asio::ip::tcp::socket& sock,

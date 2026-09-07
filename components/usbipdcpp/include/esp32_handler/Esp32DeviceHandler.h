@@ -61,7 +61,7 @@ namespace usbipdcpp
 
         ~Esp32DeviceHandler() override;
 
-        void on_new_connection(Session& current_session, error_code& ec) override;
+        void on_new_connection(TransferResponder& responder, error_code& ec) override;
         void on_disconnection(error_code& ec) override;
         void handle_unlink_seqnum(std::uint32_t unlink_seqnum, std::uint32_t cmd_seqnum) override;
 
