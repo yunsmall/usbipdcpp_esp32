@@ -333,7 +333,11 @@ usbipdcpp::error_code usbipdcpp::Esp32Server::start(asio::ip::tcp::endpoint &ep)
         cfg.pin_to_core = 1;
         switch (purpose) {
             case ThreadPurpose::NetworkIO:
-                cfg.stack_size = 4096;
+                // 4096 实测不足：accept 协程里直接打日志，spdlog sink 链跑在调用
+                // 线程栈上（esp32 上每 sink 帧含 ~512B 内嵌 format 缓冲），与
+                // asio 完成链叠加会把线程压爆（溢出点实测在 UART 写字符途中）。
+                // 与 Session 线程栈保持一致，栈只涨 4KB
+                cfg.stack_size = 8192;
                 cfg.thread_name = "usbipd_nio";
                 break;
             case ThreadPurpose::SessionMain:
@@ -529,7 +533,6 @@ void usbipdcpp::Esp32Server::remove_gone_device(usb_device_handle_t dev) {
                                      return item.second == dev;
                                  });
     if (find_ret != host_devices.end()) {
-        auto address = find_ret->first;
         host_devices.erase(find_ret);
         SPDLOG_TRACE("成功从所有设备中移除拔除的设备");
         // busid 是 bind 时缓存在 UsbDevice 里的端口拓扑字符串（见 tools.h
@@ -561,4 +564,28 @@ void usbipdcpp::Esp32Server::remove_gone_device(usb_device_handle_t dev) {
             }
         }
     }
+}
+
+std::vector<usbipdcpp::Esp32Server::DeviceSnapshot> usbipdcpp::Esp32Server::list_device_snapshots() {
+    std::vector<DeviceSnapshot> out;
+    // 持锁快照：available/using 两容器分别对应“空闲可共享”与“被客户端占用”，
+    // 与设备插拔/session 启停的写路径互斥，保证读到一致的两组数据
+    std::lock_guard lock(server.get_devices_mutex());
+    for (auto &device: server.get_available_devices()) {
+        out.push_back(DeviceSnapshot{
+                .busid = device->busid,
+                .vendor_id = device->vendor_id,
+                .product_id = device->product_id,
+                .in_use = false,
+        });
+    }
+    for (auto &[busid, device]: server.get_using_devices()) {
+        out.push_back(DeviceSnapshot{
+                .busid = busid,
+                .vendor_id = device->vendor_id,
+                .product_id = device->product_id,
+                .in_use = true,
+        });
+    }
+    return out;
 }

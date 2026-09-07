@@ -2,8 +2,12 @@
 
 #include <usb/usb_host.h>
 
+#include <cstdint>
 #include <shared_mutex>
+#include <map>
 #include <mutex>
+#include <string>
+#include <vector>
 
 #include <asio.hpp>
 
@@ -28,6 +32,25 @@ namespace usbipdcpp
         void stop();
 
         ~Esp32Server();
+
+        // ========== 状态查询（供网页/console 等只读展示面板用） ==========
+
+        /**
+         * @brief 单台已接入设备的只读快照
+         */
+        struct DeviceSnapshot
+        {
+            std::string busid;        // 端口拓扑 busid，客户端 attach 用这个
+            std::uint16_t vendor_id = 0;
+            std::uint16_t product_id = 0;
+            bool in_use = false;      // true = 已被某远程客户端 attach（正在使用）
+        };
+
+        /**
+         * @brief 所有已接入设备的快照（内部持 devices_mutex 拷贝，可随时调用）。
+         *        空闲设备在前、被客户端占用的在后
+         */
+        std::vector<DeviceSnapshot> list_device_snapshots();
 
     protected:
         Server server;
