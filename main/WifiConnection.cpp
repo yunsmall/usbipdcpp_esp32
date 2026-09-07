@@ -116,6 +116,12 @@ esp_err_t WifiConnection::start()
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    // 关掉 modem sleep（默认 WIFI_PS_MIN_MODEM）：省电模式下 AP 按 802.11
+    // 省电协议把下行帧（含 TCP ACK）缓存到 beacon 窗口才投递，TCP 吞吐被压
+    // 到 beacon 周期量级、延迟带抖动——usbip 是持续双向流量，两个方向都吃
+    // 亏且设备常驻供电，省电的收益（几 mA）远小于稳定性损失
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
     ESP_LOGI(TAG, "wifi_init_sta finished.");
     return ESP_OK;
 }
