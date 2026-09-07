@@ -20,6 +20,8 @@
 - 🌐 **多设备支持** - 支持 USB 集线器，可同时导出多个设备
 - ⚡ **零拷贝高性能** - 直接访问 DMA 缓冲区，消除数据拷贝开销，实现极致吞吐量
 - 🛡️ **健壮的连接处理** - 设备在会话中被拔出时自动清理资源
+- 🖥️ **WiFi 运行时配置** - 通过网页或专用串口控制台改 WiFi，凭据存 NVS、重启仍生效——无需重新编译
+- 📊 **设备状态面板** - 网页与串口均可查看已接入设备（busid、VID:PID、远程占用状态）
 
 ## 📋 环境要求
 
@@ -49,17 +51,19 @@ git clone --recursive https://github.com/yunsmall/usbipdcpp_esp32.git
 cd usbipdcpp_esp32
 ```
 
-### 2. 配置 WiFi
+### 2. 配置 WiFi（可选）
 
-通过 menuconfig 设置 WiFi 凭据：
+仓库中的按芯片配置文件（`sdkconfig.defaults.esp32s3` / `esp32p4`）有意**不含** WiFi 凭据——全新构建开机没有网络。二选一提供凭据：
+
+**方式 A — 编译期默认（开机即连）：**
 
 ```bash
 idf.py menuconfig
 ```
 
-进入 `Usbipdcpp WiFi Configuration`，设置：
-- `Usbipd WiFi SSID` - WiFi 名称
-- `Usbipd WiFi Password` - WiFi 密码
+进入 `Usbipdcpp WiFi Configuration`，设置 `Usbipd WiFi SSID` / `Usbipd WiFi Password`。
+
+**方式 B — 烧录后运行时配置**：通过网页或专用串口控制台（无需重编译，凭据存 NVS、重启仍生效）。见下方*管理与配置*章节。
 
 ### 3. 编译烧录
 
@@ -93,6 +97,45 @@ sudo usbip list -r <ESP32_IP>
 # 连接设备
 sudo usbip attach -r <ESP32_IP> -b <BUSID>
 ```
+
+## 🖥️ 管理与配置
+
+WiFi 与设备状态都支持运行时管理。WiFi 凭据存 NVS（命名空间 `wifi`），每次开机自动应用——换网络永远不需要重新编译固件。
+
+### 网页管理页（联网时）
+
+浏览器打开 `http://<ESP32_IP>/`（HTTP 端口 80）：
+
+- **USB 设备卡** — 当前接入的设备，显示 `busid`、`VID:PID` 与占用状态（空闲 / 被远程客户端使用）。每 5 秒自动刷新
+- **WiFi 卡**（默认折叠）— 当前 SSID/IP；修改凭据（设备会断开当前连接重连到新 AP）；配错网时串口救急的接线提示。密码留空 = 开放网络
+
+REST API：`GET /api/status`（连接状态 + 配置口 GPIO）、`GET /api/devices`（设备列表）、`POST /api/wifi`（form-urlencoded：`ssid=..&password=..`）
+
+### 串口配置口（断网 / 配错 WiFi 时）
+
+连不上网时，用**专用配置 UART** 配置——引脚随芯片不同（Kconfig：`USBIPD_CFG_UART_TX_GPIO` / `USBIPD_CFG_UART_RX_GPIO`）：
+
+| 芯片 | 配置口 TX | 配置口 RX |
+|------|-----------|-----------|
+| ESP32-S3 | GPIO17 | GPIO18 |
+| ESP32-P4 | GPIO4 | GPIO5 |
+
+USB 转 TTL 串口线**交叉**接：适配器 RX → 设备 TX、适配器 TX → 设备 RX、GND 共地。终端 115200 8N1 打开后用内置命令（`help` 查看全部）：
+
+| 命令 | 作用 |
+|------|------|
+| `wifi_set <ssid> [password]` | 设置 WiFi 并重连（存 NVS；省略密码 = 开放网络） |
+| `wifi_show` / `wifi_reset` | 查看当前配置 / 清空 NVS 回编译期默认 |
+| `devices` | 列出已接入 USB 设备（busid / VID:PID / 占用状态） |
+| `mem` | 打印堆内存占用 |
+| `logs` | 把 UART0 主日志镜像到配置口（Ctrl-C 停止） |
+| `about` | 固件简介 |
+
+镜像日志按 `\r\n` 行尾写出，真实串口终端上不会出现阶梯换行。
+
+### 网页本地预览（不用烧写）
+
+网页是编译期嵌入的单个静态文件（`main/web/index.html`）。不烧写直接调布局/脚本：运行 `python main/web/mock_server.py` 后浏览器打开 `http://127.0.0.1:8000`。mock 提供假的 `/api/status`、`/api/devices` 响应；改脚本顶部数据可预览不同状态（未连接、配置口未启用、超长 SSID…）。
 
 ## 🏗️ 架构图
 
@@ -137,7 +180,7 @@ sudo usbip attach -r <ESP32_IP> -b <BUSID>
 
 ## ⚡ 性能优化
 
-本项目利用 usbipdcpp v1.0.1 的零拷贝架构实现最大吞吐量：
+本项目利用 usbipdcpp 的零拷贝架构实现最大吞吐量：
 
 - **直接 DMA 缓冲区访问**：USB 传输缓冲区分配在 DMA 可访问内存中，直接用于网络 I/O，消除中间数据拷贝
 - **RAII 传输管理**：`TransferHandle` 自动管理缓冲区生命周期，无需手动内存管理

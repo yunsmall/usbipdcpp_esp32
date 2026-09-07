@@ -3,12 +3,10 @@
 #include <cstring>
 #include <iostream>
 #include <thread>
-#include <semaphore>
 
 #include <nvs_flash.h>
 #include <esp_log.h>
 #include <esp_system.h>
-#include <esp_wifi.h>
 #include <esp_pthread.h>
 #include <usb/usb_host.h>
 
@@ -22,19 +20,14 @@
 
 #include "esp32_handler/Esp32Server.h"
 
+#include "ConfigConsole.h"
+#include "HttpConfigApi.h"
+#include "WifiConfigManager.h"
+#include "WifiConnection.h"
 
 using namespace std;
 
 auto TAG = "tcpip_test";
-
-std::atomic_bool wifi_thread_should_stop = false;
-
-std::binary_semaphore wifi_reconnect_semaphore{0};
-std::thread wifi_connect_thread;
-
-auto wifi_ssid = CONFIG_USBIPD_WIFI_SSID;
-
-auto wifi_passwd = CONFIG_USBIPD_WIFI_PASSWORD;
 
 constexpr std::uint16_t listening_port = 3240;
 
@@ -45,75 +38,6 @@ esp_pthread_cfg_t create_config(const char *name, int core_id, int stack, int pr
     cfg.stack_size = stack;
     cfg.prio = prio;
     return cfg;
-}
-
-static void event_handler(void *arg, esp_event_base_t event_base,
-                          int32_t event_id, void *event_data) {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    }
-    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGI(TAG, "connect to the AP fail");
-        wifi_reconnect_semaphore.release();
-    }
-    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        auto *event = static_cast<ip_event_got_ip_t *>(event_data);
-        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-    }
-}
-
-
-void start_always_try_connecting_to_wifi() {
-    ESP_ERROR_CHECK(esp_netif_init());
-
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-        ESP_EVENT_ANY_ID,
-        &event_handler,
-        nullptr,
-        &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-        IP_EVENT_STA_GOT_IP,
-        &event_handler,
-        nullptr,
-        &instance_got_ip));
-
-    wifi_config_t wifi_config{};
-    strncpy(reinterpret_cast<char *>(wifi_config.sta.ssid), wifi_ssid, std::size(wifi_config.sta.ssid)-1);
-    strncpy(reinterpret_cast<char *>(wifi_config.sta.password), wifi_passwd, std::size(wifi_config.sta.password)-1);
-    wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
-    wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
-
-    esp_pthread_cfg_t pthread_cfg = esp_pthread_get_default_config();
-    pthread_cfg.prio = 10;
-    pthread_cfg.pin_to_core = 1; // 设置核心1
-    pthread_cfg.thread_name = "wifi_connect_thread";
-    esp_pthread_set_cfg(&pthread_cfg);
-    wifi_connect_thread = std::thread([]() {
-        while (!wifi_thread_should_stop) {
-            wifi_reconnect_semaphore.acquire();
-            if (wifi_thread_should_stop)
-                break;
-            ESP_LOGI(TAG, "wifi reconnecting");
-            esp_wifi_connect();
-        }
-    });
-    esp_pthread_cfg_t default_cfg = esp_pthread_get_default_config();
-    esp_pthread_set_cfg(&default_cfg);
-
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "wifi_init_sta finished.");
 }
 
 std::thread usb_host_event_thread;
@@ -184,7 +108,8 @@ void init_all() {
 
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
 
-    start_always_try_connecting_to_wifi();
+    // WiFi 初始化 + 自动连接/重连（实现已拆到 WifiConnection）
+    WifiConnection::instance().start();
 
     init_usb_host();
 }
@@ -192,17 +117,26 @@ void init_all() {
 using namespace usbipdcpp;
 
 int thread_main() {
+    // 配置口 console 必须先于一切日志初始化：镜像钩子（esp_log hook + spdlog sink
+    // 追加）要在任何并发打日志之前装好（sinks() 裸引用 vector 运行中增删有 data
+    // race，见 ConfigConsole.cpp UartMirrorSink 注释）。REPL 命令的 wifi set 真正
+    // 执行发生在用户输入时，彼时 init_all 早已完成，顺序上无依赖
+    ConfigConsole::instance().init();
+
     ESP_LOGI(TAG, "初始化所有设备");
     init_all();
 
-    ESP_LOGI(TAG, "连接wifi ssid:%s", wifi_ssid);
+    ESP_LOGI(TAG, "连接wifi ssid:%s", WifiConfigManager::instance().ssid().c_str());
     // The password is intentionally not logged — serial logs are often shared
     // (in issue reports, screen shares, crash dumps) and this would leak the
     // WiFi credential. If you need to verify the configured password for
     // debugging, read CONFIG_USBIPD_WIFI_PASSWORD from sdkconfig directly.
-    ESP_LOGI(TAG, "连接wifi password: <redacted, length=%d>", (int)strlen(wifi_passwd));
+    ESP_LOGI(TAG, "连接wifi password: <redacted, length=%d>", (int)WifiConfigManager::instance().password().size());
 
     spdlog::set_level(spdlog::level::trace);
+
+    // HTTP 配置服务（绑定 0.0.0.0，WiFi 断/连不影响监听）
+    HttpConfigApi::instance().init();
 
     asio::ip::tcp::endpoint listen_endpoint(asio::ip::tcp::v4(), listening_port);
 
@@ -262,15 +196,11 @@ int thread_main() {
         return -1;
     }
 
-    // SPDLOG_INFO("Start turning over left button");
-    // while (true) {
-    //     {
-    //         std::lock_guard lock(mouse_interface_handler.data_mutex);
-    //         mouse_interface_handler.left_pressed = !mouse_interface_handler.left_pressed;
-    //     }
-    //     SPDLOG_INFO("Turn over left button");
-    //     std::this_thread::sleep_for(std::chrono::seconds(1));
-    // }
+    // 设备面板数据源（网页 /api/devices 与配置口 devices 命令）：server 在本
+    // 线程栈上、进程存活期有效，start 前访问只会拿到空列表，无害
+    HttpConfigApi::instance().set_server(&server);
+    ConfigConsole::instance().set_server(&server);
+    
     while (true) {
         std::this_thread::sleep_for(chrono::seconds(5));
         ESP_LOGI(TAG, "Free: %lu, Min: %lu, DMA free: %lu, DMA min: %lu, PSRAM free: %lu, PSRAM min: %lu, DMA max block: %lu",
@@ -289,6 +219,11 @@ int thread_main() {
 
 
 extern "C" void app_main(void) {
+    // 必须把主流程包进 std::thread（esp_pthread → FreeRTOS 任务）再 join：
+    // spdlog 的并发安全依赖 pthread 原语（mutex/guard/once），而 pthread 环境只对
+    // pthread_create 创建的任务完整注册——app_main 的 main task 不是 pthread 创建的，
+    // 直接在 main task 里跑 thread_main（首次打 spdlog 日志即初始化并发原语）会崩
+    // （实测）。join 让 main task 保持存活，app_main 不返回
     std::thread main_thread([&]() {
         ESP_LOGI(TAG, "启动主线程main函数");
         thread_main();

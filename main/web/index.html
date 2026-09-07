@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<!-- 本文件由 main/CMakeLists.txt 的 EMBED_FILES 嵌入固件，改动后需重新编译。
+     本地预览（不用烧写）：先运行同目录 mock_server.py，再开 http://127.0.0.1:8000。
+     JS 调 HttpConfigApi 提供的 /api/status（WiFi）与 /api/devices（USB 设备）。 -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>usbipdcpp 管理面板</title>
+<style>
+body{font-family:'Microsoft YaHei','Segoe UI',sans-serif;background:#eef1f5;margin:0;color:#2b2f36}
+.wrap{max-width:520px;margin:0 auto;padding:32px 16px}
+.card{background:#fff;border-radius:12px;padding:24px 28px;box-shadow:0 4px 16px rgba(40,60,90,.15);margin-bottom:20px}
+.card h2{margin:0 0 4px;font-size:20px;display:flex;align-items:center;justify-content:space-between}
+.sub{color:#8a9199;font-size:13px;margin:0 0 16px;line-height:1.6}
+#dot{width:10px;height:10px;border-radius:50%;background:#c3c9d1;flex:none}
+label{display:block;font-size:13px;color:#5a6470;margin-bottom:6px}
+.mt{margin-top:14px}
+input{box-sizing:border-box;width:100%;padding:10px 12px;font-size:14px;border:1px solid #d5dae1;border-radius:8px;outline:none}
+button{width:100%;margin-top:20px;padding:11px;font-size:15px;color:#fff;background:#2f9e63;border:0;border-radius:8px;cursor:pointer}
+button.mini{width:auto;margin:0;padding:4px 12px;font-size:12px;border-radius:6px;background:#5b7cfa}
+/* WiFi 卡默认折叠（连上后一般不关心，展开才显示表单）：
+   摘要行左侧标题、右侧连接状态点，隐藏浏览器默认三角换成文字箭头 */
+details.card{padding:16px 20px}
+details.card>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px}
+details.card>summary::-webkit-details-marker{display:none}
+details.card>summary::after{content:'修改 ▾';color:#9aa3ad;font-size:12px;flex:none}
+details.card[open]>summary::after{content:'收起 ▴'}
+.sumtitle{font-size:20px;font-weight:600}
+.sumstatus{font-size:13px;color:#5a6470;display:flex;align-items:center;gap:6px;
+    overflow:hidden;white-space:nowrap;text-overflow:ellipsis;min-width:0;flex:1}
+.wifi-body{margin-top:16px}
+/* 当前 WiFi 信息独立成块、逐行展示：SSID 最长 32 字符，折叠摘要一行塞不下 */
+.curinfo{background:#f6f8fa;border-radius:8px;padding:10px 14px;margin-bottom:16px}
+.curinfo .row{display:flex;gap:10px;padding:2px 0;font-size:14px;line-height:1.5}
+.curinfo .label{flex:none;width:5em;color:#5a6470;font-size:13px}
+.curinfo .value{min-width:0;word-break:break-all}
+.msg{display:none;margin:14px 0 0;font-size:13px;line-height:1.6}
+/* 串口救急提示：配错 WiFi 断网后靠配置口 UART 重配，接线信息来自 /api/status */
+.hint{margin-top:16px;padding:10px 12px;border-radius:8px;background:#f6f8fa;font-size:13px;color:#5a6470;line-height:1.8}
+.hint code{background:#eceff3;padding:0 5px;border-radius:4px;color:#2b2f36;word-break:break-all}
+.devbox{min-height:60px;font-size:14px}
+.none{color:#9aa3ad;text-align:center;padding:20px 0}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:9px 8px;border-bottom:1px solid #eef0f3;font-size:14px}
+th{color:#8a9199;font-size:13px;font-weight:normal}
+td.mono{font-family:Consolas,Menlo,monospace}
+.badge{display:inline-block;padding:3px 10px;border-radius:10px;font-size:12px}
+.badge.idle{background:#e6f6ee;color:#1e7d4e}
+.badge.busy{background:#fdf1e3;color:#b26a00}
+.foot{text-align:center;color:#9aa3ad;font-size:12px;margin-top:4px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h2>USB 设备<button class="mini" onclick="refreshAll()">刷新</button></h2>
+    <p class="sub">插在 ESP32 USB Host 口上的设备，可通过 USB/IP 网络共享给电脑</p>
+    <div id="devbox" class="devbox"></div>
+  </div>
+
+  <!-- 设备信息是主关注点放最上；WiFi 连上后无需管理，默认收起 -->
+  <details id="wifipanel" class="card">
+    <summary>
+      <span class="sumtitle">WiFi</span>
+      <!-- 折叠摘要只留最短状态，详情在展开区逐行展示 -->
+      <span class="sumstatus"><span id="dot"></span><span id="st_val">状态读取中…</span></span>
+    </summary>
+    <div class="wifi-body">
+      <div class="curinfo">
+        <div class="row"><span class="label">SSID</span><span class="value" id="ssid_val"></span></div>
+        <div class="row"><span class="label">IP 地址</span><span class="value" id="ip_val"></span></div>
+      </div>
+      <p class="sub">修改会断开当前连接并重连</p>
+      <label for="ssid">WiFi 名称（SSID）</label>
+      <input id="ssid" placeholder="例如 my_wifi" spellcheck="false">
+      <label for="password" class="mt">密码（开放网络留空）</label>
+      <input id="password" type="password" placeholder="不填 = 开放网络">
+      <button onclick="saveWifi()">保存并重连</button>
+      <p id="msg" class="msg"></p>
+      <!-- 救急路径：本页只能联网访问，配错 WiFi 断网时按此接线走串口重配。
+           启用/未启用两种状态整块切换（见 refreshWifi） -->
+      <div class="hint" id="hint_serial">
+        配错 WiFi 连不上本页时，用 USB 转 TTL 串口线（115200，GND 共地）接配置口，
+        在终端执行 <code>wifi_set &lt;SSID&gt; [password]</code> 重新配网
+        （<code>help</code> 查看全部命令）：
+        <div class="hint-row">TTL 的 RX → 本机 TX 脚：GPIO<span id="cfg_tx"></span></div>
+        <div class="hint-row">TTL 的 TX → 本机 RX 脚：GPIO<span id="cfg_rx"></span></div>
+      </div>
+      <div class="hint" id="hint_noserial" style="display:none">
+        配置口 UART 未编译进本固件（Kconfig 的 USBIPD_CFG_CONSOLE_ENABLE 关闭），
+        无法用串口命令行救急——需重新编译开启该功能，或换一个能连上的 WiFi 后回来配置
+      </div>
+    </div>
+  </details>
+  <p class="foot">设备列表每 5 秒自动刷新</p>
+</div>
+
+<script>
+function setMsg(text, ok) {
+    const m = document.getElementById('msg');
+    m.style.display = 'block';
+    m.textContent = text;
+    m.style.color = ok ? '#1e7d4e' : '#c0392b';
+}
+
+async function refreshWifi() {
+    try {
+        const j = await (await fetch('/api/status')).json();
+        document.getElementById('dot').style.background = j.connected ? '#2f9e63' : '#d64545';
+        document.getElementById('st_val').textContent = j.connected ? '已连接' : '未连接';
+        document.getElementById('ssid_val').textContent = j.ssid || '（未配置）';
+        document.getElementById('ip_val').textContent = j.ip || '—';
+        // 配置口 GPIO（-1 = 该功能编译期未启用）：两种状态整块切换，
+        // 未启用时展示说明块而非残缺的接线行
+        const console_ok = j.console_tx >= 0 && j.console_rx >= 0;
+        document.getElementById('hint_serial').style.display = console_ok ? '' : 'none';
+        document.getElementById('hint_noserial').style.display = console_ok ? 'none' : '';
+        if (console_ok) {
+            document.getElementById('cfg_tx').textContent = j.console_tx;
+            document.getElementById('cfg_rx').textContent = j.console_rx;
+        }
+    } catch (e) {
+        document.getElementById('st_val').textContent = '无法连接设备';
+    }
+}
+
+async function refreshDevices() {
+    const box = document.getElementById('devbox');
+    let list;
+    try {
+        list = (await (await fetch('/api/devices')).json()).devices || [];
+    } catch (e) {
+        box.textContent = '';
+        const none = document.createElement('div');
+        none.className = 'none';
+        none.textContent = '无法获取设备列表';
+        box.appendChild(none);
+        return;
+    }
+    box.textContent = '';
+    if (!list.length) {
+        const none = document.createElement('div');
+        none.className = 'none';
+        none.textContent = '未检测到 USB 设备';
+        box.appendChild(none);
+        return;
+    }
+    const table = document.createElement('table');
+    const head = document.createElement('tr');
+    for (const t of ['busid', 'VID:PID', '状态']) {
+        const th = document.createElement('th');
+        th.textContent = t;
+        head.appendChild(th);
+    }
+    table.appendChild(head);
+    for (const d of list) {
+        const tr = document.createElement('tr');
+        const c1 = document.createElement('td');
+        c1.textContent = d.busid;
+        c1.className = 'mono';
+        const c2 = document.createElement('td');
+        c2.textContent = d.vid + ':' + d.pid;
+        c2.className = 'mono';
+        const c3 = document.createElement('td');
+        const b = document.createElement('span');
+        b.className = 'badge ' + (d.in_use ? 'busy' : 'idle');
+        b.textContent = d.in_use ? '使用中' : '空闲';
+        c3.appendChild(b);
+        tr.append(c1, c2, c3);
+        table.appendChild(tr);
+    }
+    box.appendChild(table);
+}
+
+async function saveWifi() {
+    const msg = document.getElementById('msg');
+    msg.style.display = 'none';
+    let r;
+    try {
+        r = await fetch('/api/wifi', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: 'ssid=' + encodeURIComponent(document.getElementById('ssid').value) +
+                  '&password=' + encodeURIComponent(document.getElementById('password').value)
+        });
+    } catch (e) {
+        // 连接被断开重连时 fetch 可能直接失败，提示后稍候自动刷新即可
+        setMsg('已断开连接，正在重连…', true);
+        refreshWifi();
+        return;
+    }
+    let text;
+    try {
+        text = JSON.parse(await r.text()).error || '已保存，正在重连…';
+    } catch (e) {
+        text = '已保存，正在重连…';
+    }
+    setMsg(text, r.ok);
+    refreshWifi();
+}
+
+function refreshAll() { refreshWifi(); refreshDevices(); }
+
+refreshAll();
+setInterval(refreshAll, 5000);
+</script>
+</body>
+</html>
