@@ -9,3 +9,46 @@ menu "Usbipdcpp WiFi Configuration"
         default "default_password"
 
 endmenu
+
+menu "Usbipdcpp Runtime Configuration"
+
+    config USBIPD_CFG_CONSOLE_ENABLE
+        bool "Enable configuration console on a dedicated UART"
+        default y
+        help
+            在独立 GPIO UART 上启动 esp_console REPL（wifi set/show/reset、
+            logs 命令），用于无网络时配置 WiFi。与系统日志的 USB 串口物理隔离。
+
+    config USBIPD_CFG_UART_NUM
+        int "Configuration console UART number"
+        default 1
+        help
+            REPL 使用的 UART 外设编号。系统日志默认在 UART0（USB 串口），
+            这里请勿使用与 CONFIG_ESP_CONSOLE_UART_NUM 相同的编号。
+
+    config USBIPD_CFG_UART_TX_GPIO
+        int "Configuration console TX GPIO"
+        default 17 if IDF_TARGET_ESP32S3
+        default 4 if IDF_TARGET_ESP32P4
+        help
+            接 CH340 之类 USB-TTL 的 TX 引脚（ESP32 侧发送）。
+
+    config USBIPD_CFG_UART_RX_GPIO
+        int "Configuration console RX GPIO"
+        default 18 if IDF_TARGET_ESP32S3
+        default 5 if IDF_TARGET_ESP32P4
+        help
+            接 CH340 之类 USB-TTL 的 RX 引脚（ESP32 侧接收）。
+
+    config USBIPD_HTTPD_ENABLE
+        bool "Enable HTTP configuration service"
+        default y
+        help
+            有网时通过 HTTP REST（GET /api/status、POST /api/wifi）改 WiFi 配置。
+            无鉴权：与 usbip 服务同信任模型（局域网内均可访问）。
+
+    config USBIPD_HTTPD_PORT
+        int "HTTP configuration service port"
+        default 80
+
+endmenu
