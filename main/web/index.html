@@ -175,18 +175,26 @@ async function refreshDevices() {
 
 async function saveWifi() {
     const msg = document.getElementById('msg');
-    msg.style.display = 'none';
+    const ssid = document.getElementById('ssid').value.trim();
+    if (!ssid) {
+        setMsg('请填写 WiFi 名称', false);
+        return;
+    }
+    // 点击立即反馈：保存会断开当前网络重连，fetch 可能等不到响应，不能干等
+    // （否则设备已重连、页面却像没反应）；后续 fetch 结果再补充/覆盖提示
+    setMsg('正在保存并切换网络，页面会短暂失联…', true);
     let r;
     try {
         r = await fetch('/api/wifi', {
             method: 'POST',
             headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-            body: 'ssid=' + encodeURIComponent(document.getElementById('ssid').value) +
+            body: 'ssid=' + encodeURIComponent(ssid) +
                   '&password=' + encodeURIComponent(document.getElementById('password').value)
         });
     } catch (e) {
-        // 连接被断开重连时 fetch 可能直接失败，提示后稍候自动刷新即可
-        setMsg('已断开连接，正在重连…', true);
+        // 服务端先应答再断网，正常能收到；仍失败说明此刻已断网，
+        // 等轮询恢复后状态自会刷新
+        setMsg('已提交，设备正在重连（页面恢复后自动显示新状态）', true);
         refreshWifi();
         return;
     }
