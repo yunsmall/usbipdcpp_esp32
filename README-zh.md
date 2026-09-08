@@ -166,6 +166,71 @@ USB 转 TTL 串口线**交叉**接：适配器 RX → 设备 TX、适配器 TX �
 └─────────────────────────────────────────────────────────┘
 ```
 
+## 🔌 在自己的项目中使用 usbipdcpp
+
+USB/IP 服务器核心在 **`components/usbipdcpp`** 组件里（usbipdcpp submodule + 构建在 IDF USB-host 栈上的 `esp32_handler` 适配层），它**不依赖 `main/` 的任何东西**——`main/` 下的内容只是本固件的交互外壳（WiFi 管理、串口 console、网页、设备面板）。只想要转发引擎的话，把 `main/` 剥掉即可。
+
+**把组件搬进你的项目：**
+
+```bash
+cp -r components/usbipdcpp <你的项目>/components/
+# 组件内嵌 usbipdcpp git submodule，在你的仓库里补上：
+git submodule add https://github.com/yunsmall/usbipdcpp <你的项目>/components/usbipdcpp/usbipdcpp
+```
+
+组件自己的 `idf_component_register` 已声明全部依赖（`asio spdlog usb pthread lwip sock_utils`），你的 `main` 只需要 `PRIV_REQUIRES usbipdcpp asio spdlog`。USB 设备走 IDF 标准 `usb` 组件（用集线器请开 `USB_HOST_HUBS_SUPPORTED`）。
+
+**最小可用集成**——不带 WiFi/串口/网页；网络栈由你的应用负责，组件只监听 TCP：
+
+```cpp
+#include <thread>
+#include <freertos/FreeRTOS.h>
+#include <usb/usb_host.h>
+#include "esp32_handler/Esp32Server.h"
+
+// usb_host 库级事件循环：需要独立任务跑整个生命周期
+static void usb_host_event_loop() {
+    while (true) {
+        uint32_t event_flags;
+        ESP_ERROR_CHECK(usb_host_lib_handle_events(portMAX_DELAY, &event_flags));
+    }
+}
+
+extern "C" void app_main() {
+    // 主流程放进 std::thread：spdlog/asio 需要完整 pthread 环境
+    // （原因见 main/esp32_usbipdcpp.cpp thread_main 上方注释）
+    std::thread main_thread([&] {
+        const usb_host_config_t host_cfg = {
+                .skip_phy_setup = false,
+                .intr_flags = ESP_INTR_FLAG_LEVEL3,
+                .enum_filter_cb = nullptr,
+        };
+        ESP_ERROR_CHECK(usb_host_install(&host_cfg));
+        std::thread(usb_host_event_loop).detach();
+
+        usbipdcpp::Esp32Server server;
+        server.init_client();   // 注册 usb_host client（设备热插拔）
+        asio::ip::tcp::endpoint ep{asio::ip::tcp::v4(), 3240};
+        auto ec = server.start(ep);   // 开始监听，内部自起网络/会话线程
+        if (ec) { /* 处理监听失败 */ }
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    });
+    main_thread.join();
+}
+```
+
+`Esp32Server::start()` 内部自带网络与 client 事件线程；插上的 USB 设备自动枚举并导出——电脑端 `usbip list -r <esp32-ip>` 查看，`usbip attach -r <esp32-ip> -b <busid>` 连接。
+
+注意：
+
+- **网络层自己写**——组件不初始化 WiFi/以太网或任何 PHY；先自己写代码把网络拉起来（STA 连接、以太网、静态/DHCP 地址，按你的项目来），再在网络上启动服务器
+- **组件范围**——usbipdcpp 只做三件事：注册 usb_host client（`Esp32Server::init_client`）、设备热插拔处理与绑定、TCP 上的 USB/IP 协议会话。其余全归你的应用，包括 `usb_host_install`（见上方示例）及其内部的 USB PHY 初始化
+- `usb_host_install` 是进程级单例，必须在创建 `Esp32Server` 前恰好调用一次
+- `Esp32Server::start` 不抛异常，失败通过返回值 `error_code` 报告；设备绑定失败内部记日志并回滚
+- `main/` 下的文件是最佳用法参考——`esp32_usbipdcpp.cpp` 的 `thread_main` 展示了完整流程，WiFi 管理/串口/网页只是同一核心外围的可选交互
+
 ## 📝 已测试设备
 
 | 设备类型 | 状态 | 备注 |

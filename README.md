@@ -166,6 +166,71 @@ The web UI is a single static file (`main/web/index.html`) embedded at compile t
 └─────────────────────────────────────────────────────────┘
 ```
 
+## 🔌 Using usbipdcpp in Your Own Project
+
+The USB/IP server core lives in the **`components/usbipdcpp`** component (usbipdcpp submodule + the `esp32_handler` glue layer on top of the IDF USB-host stack). It has **no dependency on `main/`** — everything under `main/` is just this firmware's interactive shell (WiFi management, serial console, web UI, status panel). Strip `main/` to just the forwarding engine.
+
+**Bring the component into your project:**
+
+```bash
+cp -r components/usbipdcpp <your_project>/components/
+# the component embeds the usbipdcpp git submodule — init it inside your repo:
+git submodule add https://github.com/yunsmall/usbipdcpp <your_project>/components/usbipdcpp/usbipdcpp
+```
+
+The component's `idf_component_register` declares its own requirements (`asio spdlog usb pthread lwip sock_utils`), so your `main` only needs `PRIV_REQUIRES usbipdcpp asio spdlog`. USB devices are accessed through the standard IDF `usb` component (enable `USB_HOST_HUBS_SUPPORTED` if you use hubs).
+
+**Minimal working integration** — no WiFi/console/UI; your application provides the network stack, the component only listens on TCP:
+
+```cpp
+#include <thread>
+#include <freertos/FreeRTOS.h>
+#include <usb/usb_host.h>
+#include "esp32_handler/Esp32Server.h"
+
+// usb_host library-level event loop: needs its own task for the whole lifetime
+static void usb_host_event_loop() {
+    while (true) {
+        uint32_t event_flags;
+        ESP_ERROR_CHECK(usb_host_lib_handle_events(portMAX_DELAY, &event_flags));
+    }
+}
+
+extern "C" void app_main() {
+    // run the main flow in a std::thread: spdlog/asio need a full pthread context
+    // (see the comments above thread_main in main/esp32_usbipdcpp.cpp)
+    std::thread main_thread([&] {
+        const usb_host_config_t host_cfg = {
+                .skip_phy_setup = false,
+                .intr_flags = ESP_INTR_FLAG_LEVEL3,
+                .enum_filter_cb = nullptr,
+        };
+        ESP_ERROR_CHECK(usb_host_install(&host_cfg));
+        std::thread(usb_host_event_loop).detach();
+
+        usbipdcpp::Esp32Server server;
+        server.init_client();   // registers the usb_host client (device hot-plug)
+        asio::ip::tcp::endpoint ep{asio::ip::tcp::v4(), 3240};
+        auto ec = server.start(ep);   // starts listening + spawns internal threads
+        if (ec) { /* handle listen failure */ }
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    });
+    main_thread.join();
+}
+```
+
+`Esp32Server::start()` spawns the network and client-event threads internally; plugged-in USB devices are enumerated and exported automatically — from a computer run `usbip list -r <esp32-ip>` then `usbip attach -r <esp32-ip> -b <busid>`.
+
+Notes:
+
+- **Networking is your job** — the component does not initialise WiFi/Ethernet or any PHY; write your own network bring-up (STA connection, Ethernet, static/DHCP, whatever your project needs) and only then start the server on it.
+- **Scope** — usbipdcpp covers exactly three things: registering the usb_host client (`Esp32Server::init_client`), device hot-plug handling/binding, and the USB/IP protocol sessions over TCP. Everything else stays with your application, including `usb_host_install` (shown in the example above) and the USB PHY setup it performs.
+- `usb_host_install` is process-wide and must be called exactly once, before creating `Esp32Server`.
+- `Esp32Server::start` never throws; errors come back via the returned `error_code`. Device bind failures are logged and rolled back internally.
+- The `main/` files are the reference usage — `esp32_usbipdcpp.cpp` (`thread_main`) shows the full sequence, with WiFi management / serial console / web UI as optional extras around the same core.
+
 ## 📝 Tested Devices
 
 | Device Type | Status | Notes |
