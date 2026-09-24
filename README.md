@@ -44,7 +44,19 @@ English | [中文](README-zh.md)
 
 ## 🚀 Quick Start
 
-### 1. Clone the Repository
+### 1. Get the Firmware
+
+**Pre-built binary (no toolchain needed):** every push to `main` rebuilds the firmware and publishes it on the [latest release page](https://github.com/yunsmall/usbipdcpp_esp32/releases/tag/latest) — the link never changes and there are no version numbers. Download the merged image for your chip (bootloader + partition table + app in one file) and write it at offset 0:
+
+```bash
+esptool.py --chip esp32s3 -p <PORT> write_flash 0x0 usbipdcpp_esp32s3_merged.bin
+# ESP32-P4:
+esptool.py --chip esp32p4 -p <PORT> write_flash 0x0 usbipdcpp_esp32p4_merged.bin
+```
+
+> `esp32s3` assumes 8MB flash and `esp32p4` assumes 32MB flash; for other flash sizes build from source. Writing from `0x0` also erases the NVS partition — configure WiFi after boot (§2).
+
+**Build from source:**
 
 ```bash
 git clone --recursive https://github.com/yunsmall/usbipdcpp_esp32.git
@@ -55,7 +67,7 @@ cd usbipdcpp_esp32
 
 The checked-in per-target configs (`sdkconfig.defaults.esp32s3` / `esp32p4`) intentionally contain **no** WiFi credentials — a fresh build boots without network. Provide credentials one of two ways:
 
-**Option A — compile-time default (connects on first boot):**
+**Option A — compile-time default (connects on first boot, build-from-source only):**
 
 ```bash
 idf.py menuconfig

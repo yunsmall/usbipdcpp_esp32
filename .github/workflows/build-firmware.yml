@@ -1,0 +1,86 @@
+# 每次 push 到 main 自动构建 S3/P4 固件，覆盖更新到固定的 "latest" release。
+# 不做版本号管理：下载地址永远不变，push 完等构建跑完，那份固件就是最新的
+name: Build Firmware
+
+on:
+  push:
+    branches: [main]
+    # 只有会改变固件产物的路径才值得重新构建（README、CLAUDE.md 之类的改动跳过）
+    paths:
+      - 'main/**'
+      - 'components/**'
+      - 'CMakeLists.txt'
+      - 'partitions.csv'
+      - 'sdkconfig.defaults.*'
+      - '.github/release-notes.md'
+      - '.github/workflows/build-firmware.yml'
+  workflow_dispatch:
+
+# 发布 release 需要写权限
+permissions:
+  contents: write
+
+# 连续 push 时取消上一个还没跑完的构建，避免两次运行抢着写同一个 release
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 两个芯片的固件不通用，各出一份
+        target: [esp32s3, esp32p4]
+    container:
+      # 与 README 要求的 ESP-IDF v5.5 对应的官方镜像
+      image: espressif/idf:release-v5.5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build firmware for ${{ matrix.target }}
+        shell: bash
+        env:
+          # 选对应的 sdkconfig.defaults.<target>；仓库里这两份不带 WiFi 凭据，配网走串口/网页
+          SDKCONFIG_DEFAULTS: sdkconfig.defaults.${{ matrix.target }}
+        run: |
+          # GitHub 的容器模式不走镜像 entrypoint，IDF 环境要自己 source
+          . $IDF_PATH/export.sh
+          idf.py set-target ${{ matrix.target }}
+          idf.py build
+          # 合并 bootloader + 分区表 + app 成单个 bin，别人从 0x0 一把烧完
+          idf.py merge-bin -o usbipdcpp_${{ matrix.target }}_merged.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.target }}
+          path: build/usbipdcpp_${{ matrix.target }}_merged.bin
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # 只为了拿 release-notes.md（不用拉 submodule）
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Update the "latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          if gh release view latest >/dev/null 2>&1; then
+            gh release edit latest --notes-file .github/release-notes.md
+          else
+            gh release create latest --title "Latest build" --target "$GITHUB_SHA" --notes-file .github/release-notes.md
+          fi
+          gh release upload latest dist/*.bin --clobber

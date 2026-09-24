@@ -44,7 +44,19 @@
 
 ## 🚀 快速开始
 
-### 1. 克隆仓库
+### 1. 获取固件
+
+**直接烧预构建固件（不用装工具链）：** 每次 push 到 `main` 都会自动重新构建并发布到[固定下载页](https://github.com/yunsmall/usbipdcpp_esp32/releases/tag/latest)——链接永远不变，没有版本号，下载到的就是最新构建。下载对应芯片的合并镜像（bootloader + 分区表 + app 合在单个文件里），从 0x0 烧写：
+
+```bash
+esptool.py --chip esp32s3 -p <串口> write_flash 0x0 usbipdcpp_esp32s3_merged.bin
+# ESP32-P4：
+esptool.py --chip esp32p4 -p <串口> write_flash 0x0 usbipdcpp_esp32p4_merged.bin
+```
+
+> `esp32s3` 固件按 8MB flash、`esp32p4` 按 32MB flash 构建，其它 flash 大小请从源码编译。从 `0x0` 整片烧写会擦掉 NVS 分区，已存的 WiFi 凭据被清空，开机后按第 2 步重新配网。
+
+**从源码编译：**
 
 ```bash
 git clone --recursive https://github.com/yunsmall/usbipdcpp_esp32.git
@@ -55,7 +67,7 @@ cd usbipdcpp_esp32
 
 仓库中的按芯片配置文件（`sdkconfig.defaults.esp32s3` / `esp32p4`）有意**不含** WiFi 凭据——全新构建开机没有网络。二选一提供凭据：
 
-**方式 A — 编译期默认（开机即连）：**
+**方式 A — 编译期默认（开机即连，仅从源码编译时可用）：**
 
 ```bash
 idf.py menuconfig
