@@ -37,7 +37,7 @@ jobs:
       # 与 README 要求的 ESP-IDF v5.5 对应的官方镜像
       image: espressif/idf:release-v5.5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
 
@@ -60,7 +60,7 @@ jobs:
           cp build/bootloader/bootloader.bin dist/usbipdcpp_${{ matrix.target }}_bootloader.bin
           cp build/partition_table/partition-table.bin dist/usbipdcpp_${{ matrix.target }}_partition-table.bin
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: firmware-${{ matrix.target }}
           path: dist/
@@ -71,9 +71,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # 只为了拿 release-notes.md（不用拉 submodule）
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: dist
           merge-multiple: true
