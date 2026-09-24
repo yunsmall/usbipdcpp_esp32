@@ -46,15 +46,19 @@ English | [中文](README-zh.md)
 
 ### 1. Get the Firmware
 
-**Pre-built binary (no toolchain needed):** every push to `main` rebuilds the firmware and publishes it on the [latest release page](https://github.com/yunsmall/usbipdcpp_esp32/releases/tag/latest) — the link never changes and there are no version numbers. Download the merged image for your chip (bootloader + partition table + app in one file) and write it at offset 0:
+**Pre-built binary (no toolchain needed):** every push to `main` rebuilds the firmware and publishes it on the [latest release page](https://github.com/yunsmall/usbipdcpp_esp32/releases/tag/latest) — the link never changes, there are no version numbers, and the release is updated in place instead of piling up old builds. Download the file(s) for your chip and flash:
 
 ```bash
+# Fresh board — merged image (bootloader + partition table + app), write at 0x0:
 esptool.py --chip esp32s3 -p <PORT> write_flash 0x0 usbipdcpp_esp32s3_merged.bin
 # ESP32-P4:
 esptool.py --chip esp32p4 -p <PORT> write_flash 0x0 usbipdcpp_esp32p4_merged.bin
+
+# Upgrade only the application — keeps stored WiFi credentials:
+esptool.py --chip esp32s3 -p <PORT> write_flash 0x10000 usbipdcpp_esp32s3_app.bin
 ```
 
-> `esp32s3` assumes 8MB flash and `esp32p4` assumes 32MB flash; for other flash sizes build from source. Writing from `0x0` also erases the NVS partition — configure WiFi after boot (§2).
+> `esp32s3` assumes 8MB flash and `esp32p4` assumes 32MB flash; for other flash sizes build from source. Writing from `0x0` erases the NVS partition — configure WiFi after boot (§2). The release also ships the separate `bootloader` / `partition-table` / `app` files if you prefer to write them individually.
 
 **Build from source:**
 

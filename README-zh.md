@@ -46,15 +46,19 @@
 
 ### 1. 获取固件
 
-**直接烧预构建固件（不用装工具链）：** 每次 push 到 `main` 都会自动重新构建并发布到[固定下载页](https://github.com/yunsmall/usbipdcpp_esp32/releases/tag/latest)——链接永远不变，没有版本号，下载到的就是最新构建。下载对应芯片的合并镜像（bootloader + 分区表 + app 合在单个文件里），从 0x0 烧写：
+**直接烧预构建固件（不用装工具链）：** 每次 push 到 `main` 都会自动重新构建并发布到[固定下载页](https://github.com/yunsmall/usbipdcpp_esp32/releases/tag/latest)——链接永远不变、没有版本号，同一个 release 原地更新，不会堆出一堆旧版本。下载对应芯片的文件烧写：
 
 ```bash
+# 全新板子——合并镜像（bootloader + 分区表 + app），从 0x0 烧：
 esptool.py --chip esp32s3 -p <串口> write_flash 0x0 usbipdcpp_esp32s3_merged.bin
 # ESP32-P4：
 esptool.py --chip esp32p4 -p <串口> write_flash 0x0 usbipdcpp_esp32p4_merged.bin
+
+# 只升级应用——保留已存的 WiFi 凭据：
+esptool.py --chip esp32s3 -p <串口> write_flash 0x10000 usbipdcpp_esp32s3_app.bin
 ```
 
-> `esp32s3` 固件按 8MB flash、`esp32p4` 按 32MB flash 构建，其它 flash 大小请从源码编译。从 `0x0` 整片烧写会擦掉 NVS 分区，已存的 WiFi 凭据被清空，开机后按第 2 步重新配网。
+> `esp32s3` 固件按 8MB flash、`esp32p4` 按 32MB flash 构建，其它 flash 大小请从源码编译。从 `0x0` 整片烧写会擦掉 NVS 分区，已存的 WiFi 凭据被清空，开机后按第 2 步重新配网。release 里也带分开的 `bootloader` / `partition-table` / `app` 文件，想自己按 `0x0`/`0x8000`/`0x10000` 分别烧的人可以直接用。
 
 **从源码编译：**
 

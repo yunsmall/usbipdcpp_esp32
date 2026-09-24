@@ -53,11 +53,17 @@ jobs:
           idf.py build
           # 合并 bootloader + 分区表 + app 成单个 bin，别人从 0x0 一把烧完
           idf.py merge-bin -o usbipdcpp_${{ matrix.target }}_merged.bin
+          # 发布内容：合并包 + 三个分体文件（分体可以只烧 app 升级，不擦 NVS）
+          mkdir -p dist
+          cp build/usbipdcpp_${{ matrix.target }}_merged.bin dist/
+          cp build/usbipdcpp_esp32.bin dist/usbipdcpp_${{ matrix.target }}_app.bin
+          cp build/bootloader/bootloader.bin dist/usbipdcpp_${{ matrix.target }}_bootloader.bin
+          cp build/partition_table/partition-table.bin dist/usbipdcpp_${{ matrix.target }}_partition-table.bin
 
       - uses: actions/upload-artifact@v4
         with:
           name: firmware-${{ matrix.target }}
-          path: build/usbipdcpp_${{ matrix.target }}_merged.bin
+          path: dist/
           if-no-files-found: error
 
   publish:
