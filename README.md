@@ -58,7 +58,7 @@ esptool.py --chip esp32p4 -p <PORT> write_flash 0x0 usbipdcpp_esp32p4_merged.bin
 esptool.py --chip esp32s3 -p <PORT> write_flash 0x10000 usbipdcpp_esp32s3_app.bin
 ```
 
-> `esp32s3` assumes 8MB flash and `esp32p4` assumes 32MB flash; for other flash sizes build from source. Writing from `0x0` erases the NVS partition — configure WiFi after boot (§2). The release also ships the separate `bootloader` / `partition-table` / `app` files if you prefer to write them individually.
+> `esp32s3` assumes 8MB flash and `esp32p4` assumes 32MB flash; for other flash sizes build from source. Writing from `0x0` erases the NVS partition — configure WiFi after boot (§2). The release also ships the separate `bootloader` / `partition-table` / `app` files if you prefer to write them individually: bootloader at `0x0` (`0x2000` on the ESP32-P4 — the ROM bootloader looks there), partition table at `0x8000`, app at `0x10000`.
 
 **Build from source:**
 

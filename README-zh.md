@@ -58,7 +58,7 @@ esptool.py --chip esp32p4 -p <串口> write_flash 0x0 usbipdcpp_esp32p4_merged.b
 esptool.py --chip esp32s3 -p <串口> write_flash 0x10000 usbipdcpp_esp32s3_app.bin
 ```
 
-> `esp32s3` 固件按 8MB flash、`esp32p4` 按 32MB flash 构建，其它 flash 大小请从源码编译。从 `0x0` 整片烧写会擦掉 NVS 分区，已存的 WiFi 凭据被清空，开机后按第 2 步重新配网。release 里也带分开的 `bootloader` / `partition-table` / `app` 文件，想自己按 `0x0`/`0x8000`/`0x10000` 分别烧的人可以直接用。
+> `esp32s3` 固件按 8MB flash、`esp32p4` 按 32MB flash 构建，其它 flash 大小请从源码编译。从 `0x0` 整片烧写会擦掉 NVS 分区，已存的 WiFi 凭据被清空，开机后按第 2 步重新配网。release 里也带分开的 `bootloader` / `partition-table` / `app` 文件，想自己分开烧的人可以直接用：bootloader 在 `0x0`（ESP32-P4 是 `0x2000`，ROM bootloader 就认这个地址）、分区表 `0x8000`、app `0x10000`。
 
 **从源码编译：**
 

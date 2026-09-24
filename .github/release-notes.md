@@ -20,11 +20,18 @@ esptool.py --chip esp32s3 -p <PORT> write_flash 0x10000 usbipdcpp_esp32s3_app.bi
 esptool.py --chip esp32p4 -p <PORT> write_flash 0x10000 usbipdcpp_esp32p4_app.bin
 ```
 
-**Or write the separate parts manually** (same layout `idf.py flash` uses):
+**Or write the separate parts manually** (the same layout `idf.py flash` uses):
 
 ```bash
 esptool.py --chip esp32s3 -p <PORT> write_flash \
   0x0 usbipdcpp_esp32s3_bootloader.bin \
   0x8000 usbipdcpp_esp32s3_partition-table.bin \
   0x10000 usbipdcpp_esp32s3_app.bin
+
+esptool.py --chip esp32p4 -p <PORT> write_flash \
+  0x2000 usbipdcpp_esp32p4_bootloader.bin \
+  0x8000 usbipdcpp_esp32p4_partition-table.bin \
+  0x10000 usbipdcpp_esp32p4_app.bin
 ```
+
+> Mind the bootloader offset — it differs per chip: `0x0` on the ESP32-S3, `0x2000` on the ESP32-P4 (the ROM bootloader looks there).
