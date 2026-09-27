@@ -282,7 +282,7 @@ Notes:
 |-------------|--------|-------|
 | USB Keyboard | ✅ Working | |
 | USB Mouse | ✅ Working | |
-| USB Flash Drive (MSC) | ✅ Working | Bulk transfer tested |
+| USB Flash Drive (MSC) | ✅ Working | Bulk transfer tested; **requires ESP32-P4** — most flash drives are High Speed, which the S3 PHY does not support |
 | USB Audio | 🔄 Testing | |
 | USB Webcam (UVC) | 🔄 Testing | Requires ESP32-P4 for High Speed |
 

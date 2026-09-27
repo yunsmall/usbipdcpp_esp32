@@ -282,7 +282,7 @@ extern "C" void app_main() {
 |---------|------|------|
 | USB 键盘 | ✅ 正常 | |
 | USB 鼠标 | ✅ 正常 | |
-| U 盘 (MSC) | ✅ 正常 | Bulk 传输已测试 |
+| U 盘 (MSC) | ✅ 正常 | Bulk 传输已测试；**需 ESP32-P4**——多数 U 盘是 High Speed 设备，S3 的 PHY 不支持 |
 | USB 音频 | 🔄 测试中 | |
 | USB 摄像头 (UVC) | 🔄 测试中 | High Speed 需要 ESP32-P4 |
 
