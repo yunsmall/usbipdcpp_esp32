@@ -198,7 +198,11 @@ esp_err_t WifiConfigManager::switch_sta_config(const std::string &ssid, const st
         last_disconnect_reason_ = 0;
     }
     // 断开旧连接（触发 DISCONNECTED 事件 → 重连线程 reconnect，与新连接互斥；
-    // 若从未连接成功 disconnect 会返回错误，忽略即可）
+    // 若从未连接成功 disconnect 会返回错误，忽略即可）。
+    // 持 mutex_ 调驱动是安全的：esp_wifi_disconnect 只向 wifi 任务投递断开命令、
+    // 不等事件处理完，而处理 DISCONNECTED 的回调（note_sta_disconnected）也要拿
+    // 这把锁——那时本函数早已返回。哪天 IDF 改成同步等事件，这里就会死锁，
+    // 届时要把它挪到锁外
     esp_wifi_disconnect();
 
     if (ssid.empty()) {
@@ -264,6 +268,8 @@ esp_err_t WifiConfigManager::apply_config(const std::string &ssid, const std::st
 
     std::string old_ssid;
     std::string old_password;
+    // 初值只是占位，紧接着就在锁内被真实状态覆盖；给个已知合法值是为了避开
+    // "可能未初始化"的编译警告
     WifiState state_before = WifiState::Connecting;
     {
         std::lock_guard lock(mutex_);

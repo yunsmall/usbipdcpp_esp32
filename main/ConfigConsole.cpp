@@ -101,7 +101,7 @@ private:
     uart_port_t port_;
 };
 
-// 配置口 UART 号（由 ConfigConsole::init 从 Kconfig 填入，供 hook/sink 使用）
+// 配置口 UART 号（Kconfig 编译期常量；REPL、镜像钩子、日志镜像命令共用这一份）
 uart_port_t s_config_uart_port = static_cast<uart_port_t>(CONFIG_USBIPD_CFG_UART_NUM);
 
 } // anonymous namespace
@@ -527,8 +527,6 @@ esp_err_t ConfigConsole::init()
 
 esp_err_t ConfigConsole::init_repl_and_mirror()
 {
-    s_config_uart_port = static_cast<uart_port_t>(CONFIG_USBIPD_CFG_UART_NUM);
-
     // ---------- 日志镜像钩子（必须在大量日志开始前安装） ----------
     // 只在启动早期向 default logger 的 sinks 追加一次镜像 sink，运行中不增删，
     // 避免与并发打日志形成 data race（见 UartMirrorSink 类注释）

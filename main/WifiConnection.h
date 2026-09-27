@@ -84,7 +84,9 @@ private:
     std::atomic_bool should_stop_{false};
     std::thread reconnect_thread_;
 
-    // 配网热点：AP netif 懒创建（首次启用热点时），DHCP server 由 IDF 内部拉起
+    // 配网热点：AP netif 懒创建（首次启用热点时），DHCP server 由 IDF 内部拉起。
+    // 只有看门狗线程读写（enable_provisioning_ap 里），所以不用 atomic：关热点
+    // 不销毁 netif，下次开热点直接复用，别的线程也不碰它
     esp_netif_t *ap_netif_ = nullptr;
     std::atomic_bool ap_active_{false};
     // 关热点请求：GOT_IP 事件回调只置位，真正的关闭在看门狗线程里做——

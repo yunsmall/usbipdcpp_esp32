@@ -166,6 +166,10 @@ int thread_main() {
         ESP_LOGE(TAG, "HTTP 配置服务启动失败：网页配置不可用（原因见上）");
     }
 
+    // 下面是被注释掉的 usbipdcpp 虚拟设备示例：不接真硬件，直接注册一个"鼠标"进
+    // 服务器，用来看 USB/IP 客户端在没接设备时能否正常走通。留着做参考，要用时
+    // 取消注释——但它写于库接口较早的版本，先照库的 examples 校对口径再编译
+    //
     // StringPool string_pool;
     //
     // std::vector<UsbInterface> interfaces = {
@@ -224,8 +228,10 @@ int thread_main() {
         return -1;
     }
 
-    // 设备面板数据源（网页 /api/devices 与配置口 devices 命令）：server 在本
-    // 线程栈上、进程存活期有效，start 前访问只会拿到空列表，无害
+    // 设备面板数据源（网页 /api/devices 与配置口 devices 命令）：server 在本线程
+    // 栈上，成功路径下本函数永不返回（下面是 while(true)），指针一直有效。两处
+    // set_server 都放在 start 成功之后：失败路径直接 return，单例里的指针保持
+    // nullptr，不会留下指向已析构对象的悬垂指针
     HttpConfigApi::instance().set_server(&server);
     ConfigConsole::instance().set_server(&server);
     

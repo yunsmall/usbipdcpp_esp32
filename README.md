@@ -131,7 +131,9 @@ The page opens with a status bar (connection state, SSID, IP, whether the provis
 
 While the provisioning hotspot is running, a banner appears at the top; on narrow screens the page also switches to the WiFi tab automatically.
 
-REST API: `GET /api/status` (connection state + config-port GPIOs + hotspot state and work mode), `GET /api/devices` (device list), `POST /api/wifi` (form-urlencoded `ssid=..&password=..`; waits for the connection result — `{"ok":true,"ip":..}` and saved on success, `{"ok":false,"error":..}` and not saved on failure), `POST /api/ap` (same fields, sets the provisioning hotspot name/password), `POST /api/mode` (`mode=sta|ap` switches the work mode immediately).
+The UI comes in Chinese and English: it follows the browser language on first open, and the button at the right end of the status bar switches it (the choice is remembered in the browser).
+
+REST API: `GET /api/status` (connection state + config-port GPIOs + hotspot state and work mode), `GET /api/devices` (device list), `POST /api/wifi` (form-urlencoded `ssid=..&password=..`; waits for the connection result — `{"ok":true,"ip":..}` and saved on success, `{"ok":false,"code":..}` and not saved on failure), `POST /api/ap` (same fields, sets the provisioning hotspot name/password), `POST /api/mode` (`mode=sta|ap` switches the work mode immediately). Errors always come back as a machine-readable `code` (the human-readable text is produced by the web UI in the visitor's language — see the `err_*` entries in `main/web/index.html`).
 
 ### Provisioning AP (configure without a serial adapter)
 

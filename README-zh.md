@@ -131,7 +131,9 @@ WiFi 与设备状态都支持运行时管理。WiFi 凭据存 NVS（命名空间
 
 处于配网模式（热点运行中）时，顶部会出现提示条，窄屏下还会自动切到 WiFi 页。
 
-REST API：`GET /api/status`（连接状态 + 配置口 GPIO + 热点状态与工作模式）、`GET /api/devices`（设备列表）、`POST /api/wifi`（form-urlencoded：`ssid=..&password=..`；同步等连接结果，成功返回 `{"ok":true,"ip":..}`，失败返回 `{"ok":false,"error":..}` 且不保存）、`POST /api/ap`（同字段，改配网热点名称/密码）、`POST /api/mode`（`mode=sta|ap` 切换工作模式，立即生效）
+界面有中英两种语言：首次打开跟随浏览器语言，状态栏右端的小按钮可随时切换（选择记在浏览器里）。
+
+REST API：`GET /api/status`（连接状态 + 配置口 GPIO + 热点状态与工作模式）、`GET /api/devices`（设备列表）、`POST /api/wifi`（form-urlencoded：`ssid=..&password=..`；同步等连接结果，成功返回 `{"ok":true,"ip":..}`，失败返回 `{"ok":false,"code":..}` 且不保存）、`POST /api/ap`（同字段，改配网热点名称/密码）、`POST /api/mode`（`mode=sta|ap` 切换工作模式，立即生效）。错误一律只回机器可读的 `code`，给人看的文案由网页按访问者语言翻译（见 `main/web/index.html` 里的 `err_*` 词条）
 
 ### 配网热点（没有串口线也能配网）
 

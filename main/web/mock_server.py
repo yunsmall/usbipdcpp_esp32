@@ -8,7 +8,7 @@
 - POST /api/wifi：与固件一致的校验（ssid 必填、32/64 长度上限）与流程——同步
   "等连接结果"（sleep 模拟，期间 state 置为断开，页面轮询能看到中间态），连上
   才置成功并应答 {"ok":true,"ip":..}；密码以 "bad" 开头时模拟凭据错误：等一会
-  应答 {"ok":false,"error":..}，不保存（state 保持断开前的原样），方便预览
+  应答 {"ok":false,"code":..}，不保存（state 保持断开前的原样），方便预览
   "连不上"的页面表现，再次保存即可恢复。
 - POST /api/ap：改配网热点（ssid 必填、密码留空=开放、至少 8 位），只改配置，
   不动 ap_active（与固件"下次热点启动时才生效"一致）
@@ -77,22 +77,22 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/mode"):
             return self._handle_mode()
         if not self.path.startswith("/api/wifi"):
-            return self._send_json({"error": "not found"}, 404)
+            return self._send_json({"code": "not_found"}, 404)
 
         # 与固件相同的 body 读取与上限
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length).decode("utf-8", "replace")
         if length <= 0 or length > MAX_FORM_BODY:
-            return self._send_json({"error": "body too large or empty"}, 400)
+            return self._send_json({"code": "bad_body"}, 400)
 
         # 与固件相同的预检（HttpConfigApi.cpp）：ssid 必填、字节长度上限
         form = urllib.parse.parse_qs(body, keep_blank_values=True)
         ssid = (form.get("ssid", [""])[0]).strip()
         password = form.get("password", [""])[0]
         if not ssid:
-            return self._send_json({"error": "ssid required"}, 400)
+            return self._send_json({"code": "ssid_required"}, 400)
         if len(ssid.encode("utf-8")) >= 32 or len(password.encode("utf-8")) >= 64:
-            return self._send_json({"error": "ssid/password too long"}, 400)
+            return self._send_json({"code": "too_long"}, 400)
 
         # 固件流程：同步等连接结果（最长 15 秒）才应答——连上才保存，失败不保存。
         # 这里用 sleep 模拟等待，期间页面轮询能看到"断开中"的中间态
@@ -100,7 +100,7 @@ class Handler(BaseHTTPRequestHandler):
         state["ip"] = ""
         if password.lower().startswith("bad"):
             time.sleep(2.0)
-            self._send_json({"ok": False, "error": "密码错误或找不到该 AP"})
+            self._send_json({"ok": False, "code": "ap_rejected"})
             print(f"[mock] 保存 WiFi: ssid={ssid!r}（bad 开头，模拟连不上，未保存）")
             return
         time.sleep(1.5)
@@ -117,14 +117,14 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length).decode("utf-8", "replace")
         if length <= 0 or length > MAX_FORM_BODY:
-            return self._send_json({"error": "body too large or empty"}, 400)
+            return self._send_json({"code": "bad_body"}, 400)
         form = urllib.parse.parse_qs(body, keep_blank_values=True)
         ssid = (form.get("ssid", [""])[0]).strip()
         password = form.get("password", [""])[0]
         if not ssid:
-            return self._send_json({"error": "ssid required"}, 400)
+            return self._send_json({"code": "ssid_required"}, 400)
         if len(ssid.encode("utf-8")) >= 32 or (password and not 8 <= len(password.encode("utf-8")) < 64):
-            return self._send_json({"error": "热点名称 1~31 字符；密码留空（开放）或 8~63 位"}, 400)
+            return self._send_json({"code": "ap_invalid_arg"}, 400)
 
         state["ap_ssid"] = ssid
         state["ap_auth"] = bool(password)
@@ -136,10 +136,10 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length).decode("utf-8", "replace")
         if length <= 0 or length > MAX_FORM_BODY:
-            return self._send_json({"error": "body too large or empty"}, 400)
+            return self._send_json({"code": "bad_body"}, 400)
         mode = urllib.parse.parse_qs(body, keep_blank_values=True).get("mode", [""])[0].lower()
         if mode not in ("sta", "ap"):
-            return self._send_json({"error": "mode must be sta or ap"}, 400)
+            return self._send_json({"code": "bad_mode"}, 400)
 
         state["work_mode"] = mode
         if mode == "ap":

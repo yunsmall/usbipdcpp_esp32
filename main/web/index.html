@@ -56,6 +56,10 @@ label{display:flex;justify-content:space-between;align-items:baseline;font-size:
 input,select{box-sizing:border-box;width:100%;padding:10px 12px;font-size:14px;border:1px solid var(--border);border-radius:8px;outline:none;background:var(--surface);color:var(--fg)}
 button{width:100%;margin-top:20px;padding:11px;font-size:15px;color:var(--on-accent);background:var(--ok);border:0;border-radius:8px;cursor:pointer}
 button.mini{width:auto;margin:0;padding:4px 12px;font-size:12px;border-radius:6px;background:var(--accent)}
+/* 语言切换：状态条右端的描边小按钮，不跟主操作抢视线 */
+.langbtn{width:auto;margin:0;padding:2px 9px;font-size:12px;line-height:1.7;
+    color:var(--fg-muted);background:transparent;border:1px solid var(--border);border-radius:8px}
+.langbtn:hover{color:var(--accent);border-color:var(--accent)}
 /* 设备号/IP/SSID 这类逐字符读的内容用等宽，0 和 O、1 和 l 不容易看混 */
 .mono{font-family:Consolas,Menlo,monospace}
 
@@ -137,25 +141,28 @@ th:last-child,td:last-child{text-align:right}
       进入配网模式时连带自动切到 WiFi 页，让他直接能填）。
       不写"连不上 WiFi"——AP 工作模式下热点是配置出来的，不是连不上 -->
   <div id="apbanner" class="banner" style="display:none">
-    设备已开启配网热点 <b id="banner_ssid"></b>。在下面填好 WiFi 名称和密码并保存，连上后此热点会自动关闭。
+    <!-- 首尾两段分开标记：SSID 是设备下发的动态内容，只能走 textContent 填，
+         不能拼进文案模板里（那就是 innerHTML 注入了） -->
+    <span data-i18n="banner_pre"></span><b id="banner_ssid"></b><span data-i18n="banner_post"></span>
   </div>
 
   <!-- 状态条：所有状态一眼看全 -->
   <div class="statusbar" id="statusbar">
     <span id="dot"></span>
-    <span id="st_val">状态读取中…</span>
+    <span id="st_val"></span>
     <span class="sep">·</span>
     <span id="ssid_val" class="ellipsis">—</span>
     <span class="sep">·</span>
     <span id="ip_val" class="mono">—</span>
     <span class="spacer"></span>
-    <span id="ap_sum" class="badge idle" style="display:none">配网热点运行中</span>
+    <span id="ap_sum" class="badge idle" style="display:none"></span>
+    <button type="button" id="langbtn" class="langbtn" data-i18n="lang_btn" onclick="toggleLang()"></button>
   </div>
 
   <nav class="tabs">
-    <button type="button" class="active" data-tab="devices" onclick="selectTab('devices')">USB 设备</button>
-    <button type="button" data-tab="wifi" onclick="selectTab('wifi')">WiFi</button>
-    <button type="button" data-tab="ap" onclick="selectTab('ap')">配网热点</button>
+    <button type="button" class="active" data-tab="devices" data-i18n="tab_devices" onclick="selectTab('devices')"></button>
+    <button type="button" data-tab="wifi" data-i18n="tab_wifi" onclick="selectTab('wifi')"></button>
+    <button type="button" data-tab="ap" data-i18n="tab_ap" onclick="selectTab('ap')"></button>
   </nav>
 
   <!-- 宽屏下这一层切成两列（见样式表末尾的媒体查询）：屏幕够宽就整块排开，
@@ -163,84 +170,335 @@ th:last-child,td:last-child{text-align:right}
   <div class="panels">
 
   <section id="tab-devices" class="panel card">
-    <h2>USB 设备<button class="mini" type="button" onclick="refreshAll()">刷新</button></h2>
-    <p class="sub">插在 ESP32 USB Host 口上的设备，可通过 USB/IP 网络共享给电脑</p>
+    <h2><span data-i18n="devices_title"></span><button class="mini" type="button" data-i18n="refresh" onclick="refreshAll()"></button></h2>
+    <p class="sub" data-i18n="devices_sub"></p>
     <div id="devbox" class="devbox"></div>
     <!-- 拿到设备列表后下一步就是去电脑上 attach，但命令不在这个页面上时
          用户得翻 README——那是最容易卡住的一步，直接放这里 -->
     <details class="hint-details">
-      <summary>在电脑上怎么用这些设备？</summary>
+      <summary data-i18n="devices_how"></summary>
       <div class="hint">
-        <div class="hint-title">Linux 客户端</div>
+        <div class="hint-title" data-i18n="linux_client"></div>
         <div class="hint-cmd">sudo modprobe vhci-hcd</div>
-        <div class="hint-cmd">sudo usbip attach -r &lt;设备IP&gt; -b &lt;busid&gt;</div>
-        <div class="hint-note">busid 就是上表里的 1-1 这种。Windows 用 usbip-win2 图形客户端，
-          服务器填设备 IP、端口 3240。完整步骤见
-          <a href="https://github.com/yunsmall/usbipdcpp_esp32" target="_blank" rel="noopener">项目主页</a></div>
+        <div class="hint-cmd" data-i18n="attach_cmd"></div>
+        <div class="hint-note"><span data-i18n="hint_note_pre"></span><a
+          href="https://github.com/yunsmall/usbipdcpp_esp32" target="_blank" rel="noopener"
+          data-i18n="project_home"></a></div>
       </div>
     </details>
   </section>
 
   <section id="tab-wifi" class="panel card" hidden>
-    <h2>WiFi 设置</h2>
-    <p class="sub">连上才保存，失败保持原配置（最长等 15 秒）</p>
+    <h2 data-i18n="wifi_title"></h2>
+    <p class="sub" data-i18n="wifi_sub"></p>
     <!-- 工作模式是"设备怎么用 WiFi"，与下面的凭据是两回事：点击立即生效，
          不需要配合表单保存（见 setWorkMode） -->
-    <label>工作模式（点击立即生效）</label>
+    <label data-i18n="work_mode"></label>
     <div class="segmented">
-      <button type="button" id="mode_sta" onclick="setWorkMode('sta')">连接 WiFi（STA）</button>
-      <button type="button" id="mode_ap" onclick="setWorkMode('ap')">只做热点（AP）</button>
+      <button type="button" id="mode_sta" data-i18n="mode_sta" onclick="setWorkMode('sta')"></button>
+      <button type="button" id="mode_ap" data-i18n="mode_ap" onclick="setWorkMode('ap')"></button>
     </div>
     <p class="sub" id="mode_hint" style="margin:8px 0 0"></p>
     <!-- 模式切换的结果紧跟在控件下面：写进页面底部那个消息条的话，视线要往下跳 -->
     <p id="modemsg" class="msg"></p>
-    <label for="ssid" class="mt">WiFi 名称（SSID）</label>
-    <input id="ssid" placeholder="例如 my_wifi" spellcheck="false">
-    <label for="password" class="mt">密码（开放网络留空）</label>
-    <input id="password" type="password" placeholder="不填 = 开放网络">
-    <button id="savebtn" onclick="saveWifi()">保存并重连</button>
+    <label for="ssid" class="mt" data-i18n="ssid_label"></label>
+    <input id="ssid" data-i18n-ph="ssid_ph" spellcheck="false">
+    <label for="password" class="mt" data-i18n="pass_label"></label>
+    <input id="password" type="password" data-i18n-ph="pass_ph">
+    <button id="savebtn" data-i18n="save_reconnect" onclick="saveWifi()"></button>
     <p id="msg" class="msg"></p>
     <!-- 救急路径：本页只能联网访问，配错 WiFi 断网时按此接线走串口重配。
          启用/未启用两种状态整块切换（见 renderStatus） -->
     <details class="hint-details">
-      <summary>连不上本页时：走串口救急</summary>
+      <summary data-i18n="serial_summary"></summary>
       <div class="hint" id="hint_serial">
-        <div class="hint-title">配错 WiFi 连不上本页时，走串口救急</div>
-        <div>用 USB 转 TTL 串口线（115200，GND 共地）接配置口，终端里执行：</div>
+        <div class="hint-title" data-i18n="serial_title"></div>
+        <div data-i18n="serial_intro"></div>
         <div class="hint-cmd">wifi_set MyAP 12345678</div>
-        <div class="hint-note">help 看全部命令；&lt;SSID&gt; [password] 只是占位记号，输入时不带</div>
-        <div class="hint-row">TTL 的 RX → 本机 TX 脚：<b>GPIO<span id="cfg_tx"></span></b></div>
-        <div class="hint-row">TTL 的 TX → 本机 RX 脚：<b>GPIO<span id="cfg_rx"></span></b></div>
+        <div class="hint-note" data-i18n="serial_note"></div>
+        <div class="hint-row"><span data-i18n="serial_tx"></span> <b>GPIO<span id="cfg_tx"></span></b></div>
+        <div class="hint-row"><span data-i18n="serial_rx"></span> <b>GPIO<span id="cfg_rx"></span></b></div>
       </div>
       <div class="hint" id="hint_noserial" style="display:none">
-        <div class="hint-title">串口救急不可用</div>
-        <div>配置口 UART 没编译进本固件（Kconfig 的 USBIPD_CFG_CONSOLE_ENABLE 关闭），
-          需重新编译开启，或先换一个能连上的 WiFi 再回来配置</div>
+        <div class="hint-title" data-i18n="serial_unavailable_title"></div>
+        <div data-i18n="serial_unavailable"></div>
       </div>
     </details>
   </section>
 
   <section id="tab-ap" class="panel card" hidden>
-    <h2>配网热点<span class="badge off" id="ap_state_val">—</span></h2>
-    <p class="sub">连不上 WiFi（或工作模式设为 AP，见 WiFi 页）时自动开启，
-      连上它访问 <b class="mono">192.168.4.1</b> 即可配网</p>
+    <h2><span data-i18n="ap_title"></span><span class="badge off" id="ap_state_val">—</span></h2>
+    <p class="sub"><span data-i18n="ap_sub_pre"></span> <b class="mono">192.168.4.1</b> <span data-i18n="ap_sub_post"></span></p>
     <!-- 当前值和修改入口放同一处：名称框直接预填现状（见 renderProvisioningAp），
          密码固件不下发，只能靠 label 右侧的小字说明现状 -->
-    <label for="ap_ssid">热点名称（SSID）</label>
-    <input id="ap_ssid" placeholder="例如 usbipd-setup" spellcheck="false" oninput="ap_ssid_dirty = true">
-    <label for="ap_pass" class="mt">密码（留空 = 开放热点）<span class="lblnote" id="ap_auth_note">—</span></label>
-    <input id="ap_pass" type="password" placeholder="不填 = 开放热点">
-    <button id="apbtn" onclick="saveAp()">保存热点配置</button>
+    <label for="ap_ssid" data-i18n="ap_ssid_label"></label>
+    <input id="ap_ssid" data-i18n-ph="ap_ssid_ph" spellcheck="false" oninput="ap_ssid_dirty = true">
+    <label for="ap_pass" class="mt"><span data-i18n="ap_pass_label"></span><span class="lblnote" id="ap_auth_note">—</span></label>
+    <input id="ap_pass" type="password" data-i18n-ph="ap_pass_ph">
+    <button id="apbtn" data-i18n="ap_save" onclick="saveAp()"></button>
     <p id="apmsg" class="msg"></p>
   </section>
 
   </div>
 
-  <p class="foot">状态与设备列表每 5 秒自动刷新 ·
-    <a href="https://github.com/yunsmall/usbipdcpp_esp32" target="_blank" rel="noopener">项目主页（README / 使用说明）</a></p>
+  <p class="foot"><span data-i18n="foot_pre"></span><a
+    href="https://github.com/yunsmall/usbipdcpp_esp32" target="_blank" rel="noopener"
+    data-i18n="foot_link"></a></p>
 </div>
 
 <script>
+// ---- 中英双语 ----
+// 文案只有这一份真相源：固件的错误响应只回机器可读的 code（见 HttpConfigApi.cpp
+// 各处的 send_json），由这里翻成当前语言。页面上的静态标签走 data-i18n /
+// data-i18n-ph（applyI18n 填），JS 里动态拼的文字走 t()。
+// 语言默认跟随浏览器，用户手动切过就记在 localStorage 里，下次直接用它
+const I18N = {
+    zh: {
+        title: 'usbipdcpp 管理面板',
+        lang_btn: 'EN',            // 按钮上写的是"切过去之后"的语言
+        // 状态条
+        status_reading: '状态读取中…',
+        connected: '已连接',
+        not_connected_ap: '未连接（配网中）',
+        not_connected: '未连接',
+        no_device_status: '无法连接设备',
+        ssid_unset: '（未配置）',
+        ap_running_ap_mode: '配网热点运行中（AP 模式）',
+        ap_running: '配网热点运行中',
+        banner_pre: '设备已开启配网热点 ',
+        banner_post: '。在下面填好 WiFi 名称和密码并保存，连上后此热点会自动关闭。',
+        // 页签
+        tab_devices: 'USB 设备',
+        tab_wifi: 'WiFi',
+        tab_ap: '配网热点',
+        // 设备页
+        devices_title: 'USB 设备',
+        refresh: '刷新',
+        devices_sub: '插在 ESP32 USB Host 口上的设备，可通过 USB/IP 网络共享给电脑',
+        devices_how: '在电脑上怎么用这些设备？',
+        linux_client: 'Linux 客户端',
+        attach_cmd: 'sudo usbip attach -r <设备IP> -b <busid>',
+        hint_note_pre: 'busid 就是上表里的 1-1 这种。Windows 用 usbip-win2 图形客户端，服务器填设备 IP、端口 3240。完整步骤见 ',
+        project_home: '项目主页',
+        devices_error: '无法获取设备列表',
+        devices_empty: '未检测到 USB 设备',
+        dtable_busid: 'busid',
+        dtable_vidpid: 'VID:PID',
+        dtable_status: '状态',
+        in_use: '使用中',
+        free: '空闲',
+        // WiFi 页
+        wifi_title: 'WiFi 设置',
+        wifi_sub: '连上才保存，失败保持原配置（最长等 15 秒）',
+        work_mode: '工作模式（点击立即生效）',
+        mode_sta: '连接 WiFi（STA）',
+        mode_ap: '只做热点（AP）',
+        mode_hint_sta: '当前连接 WiFi：连不上时自动开配网热点，并在后台继续重试',
+        mode_hint_ap: '当前只做配网热点，不尝试连 WiFi',
+        ssid_label: 'WiFi 名称（SSID）',
+        ssid_ph: '例如 my_wifi',
+        pass_label: '密码（开放网络留空）',
+        pass_ph: '不填 = 开放网络',
+        save_reconnect: '保存并重连',
+        serial_summary: '连不上本页时：走串口救急',
+        serial_title: '配错 WiFi 连不上本页时，走串口救急',
+        serial_intro: '用 USB 转 TTL 串口线（115200，GND 共地）接配置口，终端里执行：',
+        serial_note: 'help 看全部命令；<SSID> [password] 只是占位记号，输入时不带',
+        serial_tx: 'TTL 的 RX → 本机 TX 脚：',
+        serial_rx: 'TTL 的 TX → 本机 RX 脚：',
+        serial_unavailable_title: '串口救急不可用',
+        serial_unavailable: '配置口 UART 没编译进本固件（Kconfig 的 USBIPD_CFG_CONSOLE_ENABLE 关闭），需重新编译开启，或先换一个能连上的 WiFi 再回来配置',
+        // 配网热点页
+        ap_title: '配网热点',
+        ap_sub_pre: '连不上 WiFi（或工作模式设为 AP，见 WiFi 页）时自动开启，连上它访问',
+        ap_sub_post: '即可配网',
+        ap_state_running: '运行中',
+        ap_state_idle: '未运行',
+        ap_ssid_label: '热点名称（SSID）',
+        ap_ssid_ph: '例如 usbipd-setup',
+        ap_pass_label: '密码（留空 = 开放热点）',
+        ap_pass_ph: '不填 = 开放热点',
+        ap_save: '保存热点配置',
+        ap_auth_set: '已设置（WPA2）',
+        ap_auth_none: '无密码',
+        // 页脚
+        foot_pre: '状态与设备列表每 5 秒自动刷新 · ',
+        foot_link: '项目主页（README / 使用说明）',
+        // 操作结果：这些是客户端拼的提示（{0} = 固件回的 code 译文或错误码）
+        err_ssid_required: '请填写 WiFi 名称',
+        err_password_too_short: '密码至少 8 位\n开放网络请留空',
+        connecting: '正在连接，最长等 15 秒…',
+        switched_network: '设备可能已切到新网络\n请用新 IP 重新打开本页查看结果',
+        save_ok: '连接成功，配置已保存',
+        save_failed: '连接失败：{0}\n配置未保存，继续使用原配置',
+        err_ap_ssid_required: '请填写热点名称',
+        err_ap_pass_short: '热点密码至少要 8 位\n想要开放热点就把密码留空',
+        ap_save_failed: '保存失败：{0}',
+        ap_no_response: '保存失败：设备无响应',
+        ap_saved: '已保存：{0}\n名称/密码改动下次开热点时生效（正在运行的热点不受影响）',
+        mode_no_response: '设备无响应\n若刚切换模式，本机可能已断网——按新网络重开本页查看结果',
+        mode_ap_ok: '已切到 AP 模式：不再尝试连 WiFi，配网热点随即开启',
+        mode_sta_ok: '已切到 STA 模式：开始连接 WiFi',
+        mode_fail: '切换失败：{0}',
+        unknown_error: '未知错误',
+        unknown_code: '未知错误（{0}）',
+        // 固件错误码（HttpConfigApi.cpp 的 code 字段）
+        err_too_long: 'SSID 或密码太长',
+        err_password_nul: '密码不能含空字符',
+        err_connect_timeout: '连接超时（15 秒内没连上）',
+        err_ap_rejected: '密码错误或找不到该 AP',
+        err_apply_failed: '配置没能应用',
+        err_ap_invalid_arg: '热点名称 1~31 字符；密码留空（开放）或 8~63 位',
+        err_save_failed: '保存失败',
+        err_mode_save_failed: '模式保存失败',
+        err_bad_mode: '模式参数只认 sta 或 ap',
+        err_bad_body: '请求内容为空或过长',
+        err_status_too_large: '设备状态数据异常',
+        err_not_found: '接口不存在'
+    },
+    en: {
+        title: 'usbipdcpp control panel',
+        lang_btn: '中文',
+        status_reading: 'Reading status…',
+        connected: 'Connected',
+        not_connected_ap: 'Not connected (setup AP)',
+        not_connected: 'Not connected',
+        no_device_status: 'Cannot reach the board',
+        ssid_unset: '(not configured)',
+        ap_running_ap_mode: 'Setup AP running (AP mode)',
+        ap_running: 'Setup AP running',
+        banner_pre: 'The board is running its setup hotspot ',
+        banner_post: '. Enter the WiFi name and password below and save; the hotspot closes automatically once connected.',
+        tab_devices: 'USB Devices',
+        tab_wifi: 'WiFi',
+        tab_ap: 'Setup AP',
+        devices_title: 'USB Devices',
+        refresh: 'Refresh',
+        devices_sub: 'Devices plugged into the ESP32 USB Host port, shared to your computer over USB/IP',
+        devices_how: 'How do I use these devices from my computer?',
+        linux_client: 'Linux client',
+        attach_cmd: 'sudo usbip attach -r <device IP> -b <busid>',
+        hint_note_pre: 'busid is the 1-1 style value in the table above. On Windows use the usbip-win2 GUI client, filling in the device IP and port 3240. Full steps: ',
+        project_home: 'project home',
+        devices_error: 'Could not fetch the device list',
+        devices_empty: 'No USB devices detected',
+        dtable_busid: 'busid',
+        dtable_vidpid: 'VID:PID',
+        dtable_status: 'Status',
+        in_use: 'in use',
+        free: 'free',
+        wifi_title: 'WiFi Settings',
+        wifi_sub: 'Saved only once it connects; a failed attempt keeps the current settings (waits up to 15 s)',
+        work_mode: 'Work mode (applies immediately)',
+        mode_sta: 'Connect to WiFi (STA)',
+        mode_ap: 'Hotspot only (AP)',
+        mode_hint_sta: 'Connecting to WiFi: a setup hotspot starts automatically if it cannot connect, and retries continue in the background',
+        mode_hint_ap: 'Hotspot only: WiFi is not attempted',
+        ssid_label: 'WiFi name (SSID)',
+        ssid_ph: 'e.g. my_wifi',
+        pass_label: 'Password (leave empty for an open network)',
+        pass_ph: 'empty = open network',
+        save_reconnect: 'Save and reconnect',
+        serial_summary: 'Cannot reach this page? Use the serial console',
+        serial_title: 'Locked out by a wrong WiFi setting? Use the serial console',
+        serial_intro: 'Wire a USB-TTL serial adapter to the console port (115200, common ground), then run:',
+        serial_note: 'help lists all commands; <SSID> [password] is placeholder notation — do not type the brackets',
+        serial_tx: 'TTL RX → board TX pin:',
+        serial_rx: 'TTL TX → board RX pin:',
+        serial_unavailable_title: 'Serial console unavailable',
+        serial_unavailable: 'The console UART is not compiled into this firmware (Kconfig USBIPD_CFG_CONSOLE_ENABLE is off). Rebuild with it enabled, or switch to a WiFi network that works first.',
+        ap_title: 'Setup AP',
+        ap_sub_pre: 'Starts automatically when WiFi cannot be reached (or when the work mode is AP, see the WiFi tab). Connect to it and open',
+        ap_sub_post: 'to configure',
+        ap_state_running: 'running',
+        ap_state_idle: 'not running',
+        ap_ssid_label: 'Hotspot name (SSID)',
+        ap_ssid_ph: 'e.g. usbipd-setup',
+        ap_pass_label: 'Password (empty = open hotspot)',
+        ap_pass_ph: 'empty = open hotspot',
+        ap_save: 'Save hotspot settings',
+        ap_auth_set: 'set (WPA2)',
+        ap_auth_none: 'no password',
+        foot_pre: 'Status and device list refresh every 5 s · ',
+        foot_link: 'Project home (README / docs)',
+        err_ssid_required: 'Please enter the WiFi name',
+        err_password_too_short: 'Password must be at least 8 characters\nLeave it empty for an open network',
+        connecting: 'Connecting, waiting up to 15 s…',
+        switched_network: 'The board may have switched networks\nReopen this page at its new IP to see the result',
+        save_ok: 'Connected, settings saved',
+        save_failed: 'Connection failed: {0}\nNothing was saved; the previous settings are still in use',
+        err_ap_ssid_required: 'Please enter the hotspot name',
+        err_ap_pass_short: 'Hotspot password must be at least 8 characters\nLeave it empty for an open hotspot',
+        ap_save_failed: 'Save failed: {0}',
+        ap_no_response: 'Save failed: no response from the board',
+        ap_saved: 'Saved: {0}\nTakes effect the next time the hotspot starts (a running hotspot is unaffected)',
+        mode_no_response: 'No response from the board\nIf you just switched modes, this machine may have lost its network — reopen the page at the new address',
+        mode_ap_ok: 'Switched to AP mode: WiFi is no longer attempted and the setup hotspot starts now',
+        mode_sta_ok: 'Switched to STA mode: connecting to WiFi',
+        mode_fail: 'Switch failed: {0}',
+        unknown_error: 'unknown error',
+        unknown_code: 'unknown error ({0})',
+        err_too_long: 'SSID or password too long',
+        err_password_nul: 'Password may not contain NUL characters',
+        err_connect_timeout: 'Connection timed out (not connected within 15 s)',
+        err_ap_rejected: 'Wrong password, or the AP was not found',
+        err_apply_failed: 'Could not apply the configuration',
+        err_ap_invalid_arg: 'Hotspot name must be 1–31 characters; password empty (open) or 8–63 characters',
+        err_save_failed: 'Could not save',
+        err_mode_save_failed: 'Could not save the work mode',
+        err_bad_mode: 'Mode must be sta or ap',
+        err_bad_body: 'Request body is empty or too large',
+        err_status_too_large: 'Device status data is malformed',
+        err_not_found: 'No such endpoint'
+    }
+};
+
+const lang_saved = localStorage.getItem('lang');
+let lang = (lang_saved === 'zh' || lang_saved === 'en') ? lang_saved
+    : ((navigator.language || '').toLowerCase().startsWith('zh') ? 'zh' : 'en');
+
+// {0}、{1} 是占位符。插进来的都是动态内容（SSID 之类），只做字符串替换，
+// 绝不拼进 innerHTML——那等于把设备下发的数据当代码执行
+function t(key, ...args) {
+    const dict = I18N[lang] || I18N.zh;
+    const s = dict[key] !== undefined ? dict[key]
+        : (I18N.zh[key] !== undefined ? I18N.zh[key] : key);
+    return args.reduce((acc, v, i) => acc.split('{' + i + '}').join(v), s);
+}
+
+// 固件错误：按 code 出本地化文案；遇到本前端不认识的 code（固件加了新分支，
+// 而页面还没跟上）就把 code 原样带出来，报 bug 时一眼能看出是哪个分支
+function tErr(code) {
+    if (!code) return t('unknown_error');
+    const key = 'err_' + code;
+    return (I18N[lang] && I18N[lang][key] !== undefined) ? t(key) : t('unknown_code', code);
+}
+
+// 把当前语言铺到页面上：静态标签、输入框占位、页面标题、<html lang>（影响
+// 浏览器断行规则和读屏发音）
+function applyI18n() {
+    document.title = t('title');
+    document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+    for (const el of document.querySelectorAll('[data-i18n]')) el.textContent = t(el.dataset.i18n);
+    for (const el of document.querySelectorAll('[data-i18n-ph]')) el.placeholder = t(el.dataset.i18nPh);
+}
+
+function toggleLang() {
+    lang = lang === 'zh' ? 'en' : 'zh';
+    localStorage.setItem('lang', lang);
+    applyI18n();
+    // 页面上已有的消息条是上一刻、上一语言的结论，直接清掉免得中英混排；
+    // 其余动态文字（状态条、设备表、热点页）交给紧接着的 refreshAll 重画
+    for (const id of ['msg', 'apmsg', 'modemsg']) {
+        document.getElementById(id).style.display = 'none';
+    }
+    refreshAll();
+}
+
+applyI18n();
+// 状态条第一格平时显示动态状态（不走 data-i18n），首个 /api/status 回来前先占位
+document.getElementById('st_val').textContent = t('status_reading');
+
 // 一次只显示一个面板：窄屏上三块内容堆成一列要一直翻，分页后每块一屏。
 // 宽屏（≥880px）下样式表强制三块全显示、这里的 hidden 不生效；页签高亮和
 // hidden 都在本函数里设置、永远同源，所以窗口宽度来回变化也不会出现
@@ -289,18 +547,18 @@ function renderProvisioningAp(j) {
     // 状态条上的徽章只在热点真运行时出现，平时不占视线
     const ap_sum = document.getElementById('ap_sum');
     ap_sum.style.display = ap_active ? '' : 'none';
-    ap_sum.textContent = j.work_mode === 'ap' ? '配网热点运行中（AP 模式）' : '配网热点运行中';
+    ap_sum.textContent = t(j.work_mode === 'ap' ? 'ap_running_ap_mode' : 'ap_running');
 
     // 名称框预填当前值，用户不用照着别处抄
     if (!ap_ssid_dirty) document.getElementById('ap_ssid').value = j.ap_ssid || '';
     // 密码固件不下发（只回有没有），只能在 label 右侧说明现状——改名字时
     // 很容易把密码框留空，那就把热点改成开放的了，先让用户看见
     document.getElementById('ap_auth_note').textContent =
-        j.ap_auth ? '已设置（WPA2）' : '无密码';
+        t(j.ap_auth ? 'ap_auth_set' : 'ap_auth_none');
     // 状态徽章挂在标题右侧：运行中 = 绿，未运行 = 灰
     const st = document.getElementById('ap_state_val');
     st.className = 'badge ' + (ap_active ? 'idle' : 'off');
-    st.textContent = ap_active ? '运行中' : '未运行';
+    st.textContent = t(ap_active ? 'ap_state_running' : 'ap_state_idle');
 }
 
 // 工作模式的分段控件是"点了就切"（见 setWorkMode），没有未提交状态，
@@ -309,9 +567,7 @@ function renderWorkMode(j) {
     const is_ap = j.work_mode === 'ap';
     document.getElementById('mode_sta').classList.toggle('active', !is_ap);
     document.getElementById('mode_ap').classList.toggle('active', is_ap);
-    document.getElementById('mode_hint').textContent = is_ap
-        ? '当前只做配网热点，不尝试连 WiFi'
-        : '当前连接 WiFi：连不上时自动开配网热点，并在后台继续重试';
+    document.getElementById('mode_hint').textContent = t(is_ap ? 'mode_hint_ap' : 'mode_hint_sta');
 }
 
 function renderStatus(j) {
@@ -319,9 +575,9 @@ function renderStatus(j) {
     // （三种颜色定义在 CSS 的 #dot.on/.warn/.err 里）
     document.getElementById('dot').className =
         j.connected ? 'on' : (j.ap_active ? 'warn' : 'err');
-    document.getElementById('st_val').textContent = j.connected ? '已连接'
-        : (j.ap_active ? '未连接（配网中）' : '未连接');
-    document.getElementById('ssid_val').textContent = j.ssid || '（未配置）';
+    document.getElementById('st_val').textContent =
+        t(j.connected ? 'connected' : (j.ap_active ? 'not_connected_ap' : 'not_connected'));
+    document.getElementById('ssid_val').textContent = j.ssid || t('ssid_unset');
     // 状态条一行放不下长 SSID（会省略号截断），悬停看全名
     document.getElementById('ssid_val').title = j.ssid || '';
     document.getElementById('ip_val').textContent = j.ip || '—';
@@ -346,7 +602,7 @@ async function refreshWifi() {
     } catch (e) {
         // 状态点一并复位：连不上设备时不能还留着上一次的绿点（回到基础样式的灰点）
         document.getElementById('dot').className = '';
-        document.getElementById('st_val').textContent = '无法连接设备';
+        document.getElementById('st_val').textContent = t('no_device_status');
         // 整条变淡：拉不到状态时 SSID/IP 只会停在上一次的值，别让它们看着像实时的
         bar.classList.add('offline');
     }
@@ -361,7 +617,7 @@ async function refreshDevices() {
         box.textContent = '';
         const none = document.createElement('div');
         none.className = 'none';
-        none.textContent = '无法获取设备列表';
+        none.textContent = t('devices_error');
         box.appendChild(none);
         return;
     }
@@ -369,15 +625,16 @@ async function refreshDevices() {
     if (!list.length) {
         const none = document.createElement('div');
         none.className = 'none';
-        none.textContent = '未检测到 USB 设备';
+        none.textContent = t('devices_empty');
         box.appendChild(none);
         return;
     }
     const table = document.createElement('table');
     const head = document.createElement('tr');
-    for (const t of ['busid', 'VID:PID', '状态']) {
+    // 循环变量别叫 t：那是翻译函数
+    for (const key of ['dtable_busid', 'dtable_vidpid', 'dtable_status']) {
         const th = document.createElement('th');
-        th.textContent = t;
+        th.textContent = t(key);
         head.appendChild(th);
     }
     table.appendChild(head);
@@ -392,7 +649,7 @@ async function refreshDevices() {
         const c3 = document.createElement('td');
         const b = document.createElement('span');
         b.className = 'badge ' + (d.in_use ? 'busy' : 'idle');
-        b.textContent = d.in_use ? '使用中' : '空闲';
+        b.textContent = t(d.in_use ? 'in_use' : 'free');
         c3.appendChild(b);
         tr.append(c1, c2, c3);
         table.appendChild(tr);
@@ -403,19 +660,19 @@ async function refreshDevices() {
 async function saveWifi() {
     const ssid = document.getElementById('ssid').value.trim();
     if (!ssid) {
-        setMsg('请填写 WiFi 名称', 'err');
+        setMsg(t('err_ssid_required'), 'err');
         return;
     }
     const pass = document.getElementById('password').value;
     // 按 UTF-8 字节算（同 saveAp）：固件与 WPA2 校验的都是字节长度；空 = 开放网络
     if (pass && new TextEncoder().encode(pass).length < 8) {
-        setMsg('密码至少 8 位\n开放网络请留空', 'err');
+        setMsg(t('err_password_too_short'), 'err');
         return;
     }
     // 固件要等实连结果（最长 15 秒）才应答，期间禁用按钮防重复提交
     const btn = document.getElementById('savebtn');
     btn.disabled = true;
-    setMsg('正在连接，最长等 15 秒…');
+    setMsg(t('connecting'));
 
     const opts = {
         method: 'POST',
@@ -434,16 +691,16 @@ async function saveWifi() {
     } catch (e) {
         // 换到别的 AP 后本机 IP 变化，响应送不到旧连接属正常；配置是否已保存
         // 取决于固件侧的连接结果，用新 IP 打开本页即可看到
-        setMsg('设备可能已切到新网络\n请用新 IP 重新打开本页查看结果');
+        setMsg(t('switched_network'));
         btn.disabled = false;
         refreshWifi();
         return;
     }
     btn.disabled = false;
     if (j && j.ok) {
-        setMsg('连接成功，配置已保存' + (j.ip ? '\nIP: ' + j.ip : ''), 'ok');
+        setMsg(t('save_ok') + (j.ip ? '\nIP: ' + j.ip : ''), 'ok');
     } else {
-        setMsg('连接失败：' + ((j && j.error) || '未知错误') + '\n配置未保存，继续使用原配置', 'err');
+        setMsg(t('save_failed', tErr(j && j.code)), 'err');
     }
     refreshWifi();
 }
@@ -451,7 +708,7 @@ async function saveWifi() {
 async function saveAp() {
     const ssid = document.getElementById('ap_ssid').value.trim();
     if (!ssid) {
-        setApMsg('请填写热点名称', 'err');
+        setApMsg(t('err_ap_ssid_required'), 'err');
         return;
     }
     const pass = document.getElementById('ap_pass').value;
@@ -459,7 +716,7 @@ async function saveAp() {
     // 中文密码误拦（4 个汉字就是 12 字节）
     if (pass && new TextEncoder().encode(pass).length < 8) {
         // 固件端也会拒（WPA2 下限 8 位），先拦一道省一次往返
-        setApMsg('热点密码至少要 8 位\n想要开放热点就把密码留空', 'err');
+        setApMsg(t('err_ap_pass_short'), 'err');
         return;
     }
     const btn = document.getElementById('apbtn');
@@ -478,7 +735,7 @@ async function saveAp() {
     try {
         j = await (await fetch('/api/ap', opts)).json();
     } catch (e) {
-        setApMsg('保存失败：设备无响应', 'err');
+        setApMsg(t('ap_no_response'), 'err');
         btn.disabled = false;
         return;
     }
@@ -486,9 +743,9 @@ async function saveAp() {
     if (j && j.ok) {
         // 固件已接受这个值，重新交给轮询同步（见 renderProvisioningAp）
         ap_ssid_dirty = false;
-        setApMsg('已保存：' + ssid + '\n名称/密码改动下次开热点时生效（正在运行的热点不受影响）', 'ok');
+        setApMsg(t('ap_saved', ssid), 'ok');
     } else {
-        setApMsg('保存失败：' + ((j && j.error) || '未知错误'), 'err');
+        setApMsg(t('ap_save_failed', tErr(j && j.code)), 'err');
     }
     refreshWifi();
 }
@@ -511,24 +768,36 @@ async function setWorkMode(mode) {
     try {
         j = await (await fetch('/api/mode', opts)).json();
     } catch (e) {
-        setModeMsg('设备无响应\n若刚切换模式，本机可能已断网——按新网络重开本页查看结果', 'err');
+        setModeMsg(t('mode_no_response'), 'err');
         btn.disabled = false;
         return;
     }
     btn.disabled = false;
     if (j && j.ok) {
-        setModeMsg(mode === 'ap' ? '已切到 AP 模式：不再尝试连 WiFi，配网热点随即开启'
-                                 : '已切到 STA 模式：开始连接 WiFi', 'ok');
+        setModeMsg(t(mode === 'ap' ? 'mode_ap_ok' : 'mode_sta_ok'), 'ok');
     } else {
-        setModeMsg('切换失败：' + ((j && j.error) || '未知错误'), 'err');
+        setModeMsg(t('mode_fail', tErr(j && j.code)), 'err');
     }
     refreshWifi();
 }
 
 function refreshAll() { refreshWifi(); refreshDevices(); }
 
+let refresh_timer = setInterval(refreshAll, 5000);
+// 页面不可见时停掉轮询：没人看的时候不必每 5 秒打两次请求（手机长期开着这个页面
+// 尤其明显）；切回来立刻刷一次，免得看到的还是离开时的旧数据
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        clearInterval(refresh_timer);
+        refresh_timer = null;
+    }
+    else if (refresh_timer === null) {
+        refreshAll();
+        refresh_timer = setInterval(refreshAll, 5000);
+    }
+});
+
 refreshAll();
-setInterval(refreshAll, 5000);
 </script>
 </body>
 </html>

@@ -37,7 +37,7 @@ void WifiConnection::event_handler(void *arg, esp_event_base_t event_base,
         WifiConfigManager::instance().reconnect();
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGI(TAG, "connect to the AP fail");
+        ESP_LOGI(TAG, "连接 AP 失败");
         // 记下原因供 apply_config 判定（密码错/找不到 AP 时提前结束等待）
         auto *event = static_cast<wifi_event_sta_disconnected_t *>(event_data);
         if (event != nullptr) {
@@ -85,6 +85,9 @@ esp_err_t WifiConnection::start()
     }
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    // 这里 abort、下面 load_config 失败却继续跑，两者不矛盾：读不到配置可以退回
+    // 编译期默认照常工作，而 WiFi 子系统本身起不来就没有任何可退回的东西——连不上
+    // AP、热点开不了、网页也没了，重启是唯一可能恢复的路径
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
     esp_event_handler_instance_t instance_any_id;

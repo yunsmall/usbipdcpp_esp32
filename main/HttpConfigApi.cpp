@@ -26,7 +26,8 @@ namespace
 
 constexpr const char *TAG = "HttpConfigApi";
 
-// POST body 上限：SSID(32)+密码(64) 的 urlencoded 形式绰绰有余，防恶意大包
+// POST body 上限：SSID(32)+密码(64) 的 urlencoded 形式实际不到 200 字节，512 既给
+// 将来加字段留了余量，也挡住恶意大包
 constexpr std::size_t MAX_FORM_BODY = 512;
 
 // JSON 字符串转义：ssid 可能含引号/反斜杠/控制字符，直接拼会破坏 JSON。
@@ -78,8 +79,9 @@ void percent_decode_into(const std::string &in, std::string &out)
 bool form_value(const std::string &body, const char *key, std::string &out)
 {
     const std::string prefix = std::string(key) + "=";
+    // 条件写 < 而不是 <=：尾随 & 之后不会再多跑一次空段，空 body 也直接不进循环
     std::size_t pos = 0;
-    while (pos <= body.size()) {
+    while (pos < body.size()) {
         const std::size_t amp = body.find('&', pos);
         const std::string segment = body.substr(pos, amp == std::string::npos ? std::string::npos : amp - pos);
         if (segment.rfind(prefix, 0) == 0) {
@@ -95,6 +97,12 @@ bool form_value(const std::string &body, const char *key, std::string &out)
     return false;
 }
 
+// 错误响应只回机器可读的 code，不带人类可读的文字：文案的唯一真相源是网页的
+// 语言字典（main/web/index.html 的 I18N），页面按 code 出当前语言的提示。页面
+// 与固件编译进同一个二进制（main/CMakeLists.txt 的 EMBED_FILES），不存在版本
+// 错配，再带一份文字就只是多一份要同步改的副本——而且固件里没法同时写中英两种，
+// 怎么选都有一边看着别扭。code 的取值见下面各调用点。
+//
 // 响应辅助：统一 Content-Type 的 JSON 响应。状态行用静态字符串表——httpd_resp_set_status
 // 只保存指针不复制（httpd_txrx.c 里就是 ra->status = status），传栈上缓冲或临时
 // string 会留下悬垂指针；用表还顺带把 404/405 之类的码映射对，不会静默变 500
@@ -133,7 +141,7 @@ esp_err_t read_form_body(httpd_req_t *req, std::string &body)
     // 只接受非空且不大的 body：content_len 为 0 或超出上限都直接拒绝（写成 <= 0
     // 是防御写法，该字段现为 size_t，与 == 0 等价）
     if (req->content_len <= 0 || static_cast<std::size_t>(req->content_len) > MAX_FORM_BODY) {
-        send_json(req, 400, "{\"error\":\"body too large or empty\"}");
+        send_json(req, 400, "{\"code\":\"bad_body\"}");
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -207,7 +215,7 @@ esp_err_t HttpConfigApi::handle_get_status(httpd_req_t *req)
         // 以后加字段或 SSID 全是待转义字符时可能顶到上限：宁可报错，也别把截断
         // 的非法 JSON 发给页面（那会让整页状态读不出来，比 500 更难排查）
         ESP_LOGE(TAG, "status JSON 超出缓冲: %d 字节", body_len);
-        return send_json(req, 500, "{\"error\":\"status too large\"}");
+        return send_json(req, 500, "{\"code\":\"status_too_large\"}");
     }
     return send_json(req, 200, body);
 }
@@ -224,6 +232,7 @@ esp_err_t HttpConfigApi::handle_get_devices(httpd_req_t *req)
         // 取一次快照：预分配与遍历都用它（range-for 里直接调也只求值一次，这里
         // 显式取出来是为了按设备数预留缓冲，省掉拼串时的反复扩容）
         const auto snapshots = server->list_device_snapshots();
+        // 设备数受 USB 拓扑限制（一条总线最多 127 个），预留的量级天然有上限
         body.reserve(64 + 128 * snapshots.size());
         bool first = true;
         for (const auto &device: snapshots) {
@@ -265,13 +274,13 @@ esp_err_t HttpConfigApi::handle_post_wifi(httpd_req_t *req)
     std::string ssid;
     std::string password;
     if (!form_value(body, "ssid", ssid) || ssid.empty()) {
-        return send_json(req, 400, "{\"error\":\"ssid required\"}");
+        return send_json(req, 400, "{\"code\":\"ssid_required\"}");
     }
     // 全空白等同未填、内嵌 NUL 则是"存下来的串和实际用的不是一个"：apply_config
     // 也会拒，但那会走到 200 + "配置未能应用"，脚本直调看不出是入参问题
     if (ssid.find_first_not_of(" \t\r\n") == std::string::npos ||
         ssid.find('\0') != std::string::npos) {
-        return send_json(req, 400, "{\"error\":\"ssid required\"}");
+        return send_json(req, 400, "{\"code\":\"ssid_required\"}");
     }
     form_value(body, "password", password); // 缺失/空 = 开放 AP
 
@@ -279,17 +288,17 @@ esp_err_t HttpConfigApi::handle_post_wifi(httpd_req_t *req)
     // 密码无论多长都不合法，先报"含空字符"比先报"长度不对"更贴近真正的原因。
     // 放过去的话 NVS 与驱动按 C 字符串截断，存的和连的不是同一串，还得回头查
     if (password.find('\0') != std::string::npos) {
-        return send_json(req, 400, "{\"error\":\"密码不能包含空字符\"}");
+        return send_json(req, 400, "{\"code\":\"password_nul\"}");
     }
     // 参数预检（与 WifiConfigManager::apply_config 相同的长度规则）：长度是请求
     // 本身的错，返回 400 比让 apply_config 报"配置未能应用"更清楚
     if (ssid.size() >= MAX_SSID_LEN || password.size() >= MAX_PASSPHRASE_LEN) {
-        return send_json(req, 400, "{\"error\":\"ssid/password too long\"}");
+        return send_json(req, 400, "{\"code\":\"too_long\"}");
     }
     // 非空密码要够 WPA2 的 8 位（空 = 开放网络）：不够的交给驱动只会在连接阶段
     // 失败，报出来的错会含糊成"密码错误或找不到 AP"
     if (!password.empty() && password.size() < 8) {
-        return send_json(req, 400, "{\"error\":\"密码至少 8 位（开放网络请留空）\"}");
+        return send_json(req, 400, "{\"code\":\"password_too_short\"}");
     }
 
     auto &manager = WifiConfigManager::instance();
@@ -305,16 +314,15 @@ esp_err_t HttpConfigApi::handle_post_wifi(httpd_req_t *req)
         return send_json(req, 200, resp);
     }
     if (err == ESP_ERR_TIMEOUT) {
-        char resp[128];
-        std::snprintf(resp, sizeof(resp), "{\"ok\":false,\"error\":\"连接超时（%d 秒内未连上）\"}",
-                      WifiConfigManager::APPLY_TIMEOUT_SECONDS);
-        return send_json(req, 200, resp);
+        // 秒数不随响应下发："等了多久"是给用户看的措辞，写在前端语言字典的
+        // connecting / err_connect_timeout 里；改 APPLY_TIMEOUT_SECONDS 时要一起改
+        return send_json(req, 200, "{\"ok\":false,\"code\":\"connect_timeout\"}");
     }
     if (err == ESP_FAIL) {
-        return send_json(req, 200, "{\"ok\":false,\"error\":\"密码错误或找不到该 AP\"}");
+        return send_json(req, 200, "{\"ok\":false,\"code\":\"ap_rejected\"}");
     }
     ESP_LOGE(TAG, "应用 WiFi 配置失败: %s", esp_err_to_name(err));
-    return send_json(req, 200, "{\"ok\":false,\"error\":\"配置未能应用\"}");
+    return send_json(req, 200, "{\"ok\":false,\"code\":\"apply_failed\"}");
 }
 
 esp_err_t HttpConfigApi::handle_post_ap(httpd_req_t *req)
@@ -330,34 +338,34 @@ esp_err_t HttpConfigApi::handle_post_ap(httpd_req_t *req)
     std::string ssid;
     std::string password;
     if (!form_value(body, "ssid", ssid) || ssid.empty()) {
-        return send_json(req, 400, "{\"error\":\"ssid required\"}");
+        return send_json(req, 400, "{\"code\":\"ssid_required\"}");
     }
     // 同 handle_post_wifi：全空白与内嵌 NUL 都按入参错误提前挡掉
     if (ssid.find_first_not_of(" \t\r\n") == std::string::npos ||
         ssid.find('\0') != std::string::npos) {
-        return send_json(req, 400, "{\"error\":\"ssid required\"}");
+        return send_json(req, 400, "{\"code\":\"ssid_required\"}");
     }
     form_value(body, "password", password); // 缺失/空 = 开放热点
     if (password.find('\0') != std::string::npos) {
-        return send_json(req, 400, "{\"error\":\"密码不能包含空字符\"}");
+        return send_json(req, 400, "{\"code\":\"password_nul\"}");
     }
 
     // 与 handle_post_wifi 对称的预检：同样的规则在入口先报 400，别让正常输错
     // 走到 apply_ap_config 里去记一条 ERROR 日志
     if (ssid.size() >= MAX_SSID_LEN ||
         (!password.empty() && (password.size() < 8 || password.size() >= MAX_PASSPHRASE_LEN))) {
-        return send_json(req, 400, "{\"error\":\"热点名称 1~31 字符；密码留空（开放）或 8~63 位\"}");
+        return send_json(req, 400, "{\"code\":\"ap_invalid_arg\"}");
     }
 
     // 名称/密码只存配置、不动正在运行的热点：此刻连着热点的就是正在配网的人，
     // 把他踢下线没有意义；新名称/密码下次热点启动时生效（见 apply_ap_config）
     const esp_err_t err = WifiConfigManager::instance().apply_ap_config(ssid, password);
     if (err == ESP_ERR_INVALID_ARG) {
-        return send_json(req, 400, "{\"error\":\"热点名称 1~31 字符；密码留空（开放）或 8~63 位\"}");
+        return send_json(req, 400, "{\"code\":\"ap_invalid_arg\"}");
     }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "保存配网热点配置失败: %s", esp_err_to_name(err));
-        return send_json(req, 200, "{\"ok\":false,\"error\":\"保存失败\"}");
+        return send_json(req, 200, "{\"ok\":false,\"code\":\"save_failed\"}");
     }
     return send_json(req, 200, "{\"ok\":true}");
 }
@@ -375,12 +383,12 @@ esp_err_t HttpConfigApi::handle_post_mode(httpd_req_t *req)
     std::string mode;
     WifiConfigManager::WifiWorkMode work_mode;
     if (!form_value(body, "mode", mode) || !WifiConfigManager::parse_work_mode(mode, work_mode)) {
-        return send_json(req, 400, "{\"error\":\"mode must be sta or ap\"}");
+        return send_json(req, 400, "{\"code\":\"bad_mode\"}");
     }
     const esp_err_t err = WifiConfigManager::instance().set_work_mode(work_mode);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "设置工作模式失败: %s", esp_err_to_name(err));
-        return send_json(req, 200, "{\"ok\":false,\"error\":\"模式保存失败\"}");
+        return send_json(req, 200, "{\"ok\":false,\"code\":\"mode_save_failed\"}");
     }
     return send_json(req, 200, "{\"ok\":true}");
 }
