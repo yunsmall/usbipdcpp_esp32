@@ -36,6 +36,11 @@ void WifiConnection::event_handler(void *arg, esp_event_base_t event_base,
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGI(TAG, "connect to the AP fail");
+        // 记下原因供 apply_config 判定（密码错/找不到 AP 时提前结束等待）
+        auto *event = static_cast<wifi_event_sta_disconnected_t *>(event_data);
+        if (event != nullptr) {
+            WifiConfigManager::instance().note_disconnect_reason(event->reason);
+        }
         self->reconnect_semaphore_.release();
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
@@ -45,6 +50,8 @@ void WifiConnection::event_handler(void *arg, esp_event_base_t event_base,
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         auto *event = static_cast<ip_event_got_ip_t *>(event_data);
         ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        // 供 apply_config 判断"本次切换后已连上"（计数增长 = 拿到了新 IP）
+        WifiConfigManager::instance().note_got_ip();
     }
 }
 

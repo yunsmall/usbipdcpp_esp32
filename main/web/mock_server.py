@@ -4,13 +4,14 @@
 行为模拟固件 HttpConfigApi/WifiConfigManager：
 - GET  /api/status：当前状态（改下方 state 可预览不同初始状态）
 - GET  /api/devices：设备列表（增删条目看表格效果）
-- POST /api/wifi：与固件一致的校验（ssid 必填、32/64 长度上限）与流程——
-  先应答 200，随即"断开"（connected=false、ip 清空，页面红点），约 2.5 秒后
-  模拟重连成功恢复绿点。密码以 "bad" 开头时模拟凭据错误：保持断开不恢复，
-  方便预览"连不上"的页面表现，再次保存即可恢复。
+- POST /api/wifi：与固件一致的校验（ssid 必填、32/64 长度上限）与流程——同步
+  "等连接结果"（sleep 模拟，期间 state 置为断开，页面轮询能看到中间态），连上
+  才置成功并应答 {"ok":true,"ip":..}；密码以 "bad" 开头时模拟凭据错误：等一会
+  应答 {"ok":false,"error":..}，不保存（state 保持断开前的原样），方便预览
+  "连不上"的页面表现，再次保存即可恢复。
 """
 import json
-import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,24 +34,6 @@ devices = {
         {"busid": "1-2", "vid": "058f", "pid": "6387", "in_use": True},
     ],
 }
-
-# 最近一次保存的密码：模拟重连结果用（见 POST /api/wifi）
-last_password = ""
-
-
-def schedule_reconnect(ssid: str) -> None:
-    """模拟固件 apply_config 后的重连：断开约 2.5 秒后连上新网恢复状态。
-    密码以 bad 开头 = 凭据错误，保持未连接直到下次保存"""
-    def reconnect():
-        if last_password.lower().startswith("bad"):
-            return  # 模拟密码错误：页面持续显示未连接
-        state["connected"] = True
-        state["ssid"] = ssid
-        state["ip"] = "192.168.1.100"
-
-    timer = threading.Timer(2.5, reconnect)
-    timer.daemon = True
-    timer.start()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -95,15 +78,22 @@ class Handler(BaseHTTPRequestHandler):
         if len(ssid.encode("utf-8")) >= 32 or len(password.encode("utf-8")) >= 64:
             return self._send_json({"error": "ssid/password too long"}, 400)
 
-        # 固件流程：应答已由返回语句发出，这里先置断开状态再排重连
-        global last_password
-        last_password = password
+        # 固件流程：同步等连接结果（最长 15 秒）才应答——连上才保存，失败不保存。
+        # 这里用 sleep 模拟等待，期间页面轮询能看到"断开中"的中间态
         state["connected"] = False
         state["ip"] = ""
-        self._send_json({"result": "ok, reconnecting"})
+        if password.lower().startswith("bad"):
+            time.sleep(2.0)
+            self._send_json({"ok": False, "error": "密码错误或找不到该 AP"})
+            print(f"[mock] 保存 WiFi: ssid={ssid!r}（bad 开头，模拟连不上，未保存）")
+            return
+        time.sleep(1.5)
+        state["connected"] = True
+        state["ssid"] = ssid
+        state["ip"] = "192.168.1.100"
+        self._send_json({"ok": True, "ip": state["ip"]})
         print(f"[mock] 保存 WiFi: ssid={ssid!r} password={'***' if password else '(空=开放网络)'}"
-              f"{'（bad 开头，模拟连不上）' if password.lower().startswith('bad') else ''}")
-        schedule_reconnect(ssid)
+              f" → 连接成功")
 
     def log_message(self, fmt, *args):
         # 静默访问日志：页面 5 秒轮询两个接口，打了会刷屏

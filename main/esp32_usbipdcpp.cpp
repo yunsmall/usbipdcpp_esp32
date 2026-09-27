@@ -126,9 +126,11 @@ int thread_main() {
     // 刷机后 WiFi 连不上时配置口串口是唯一救急入口，开机日志直接给出接线
     // 信息——引脚随板子/Kconfig 变化，只写在 README 里刷完机根本找不到
 #if CONFIG_USBIPD_CFG_CONSOLE_ENABLE
-    ESP_LOGI(TAG, "WiFi 连不上时用配置口串口配网: UART%d TX=GPIO%d RX=GPIO%d @115200 8N1，命令 wifi_set <ssid> [password]",
+    ESP_LOGI(TAG, "WiFi 连不上时用配置口串口配网: UART%d TX=GPIO%d RX=GPIO%d @115200 8N1",
              CONFIG_USBIPD_CFG_UART_NUM, CONFIG_USBIPD_CFG_UART_TX_GPIO,
              CONFIG_USBIPD_CFG_UART_RX_GPIO);
+    // 直接给真实示例：<> [] 那样的占位记法容易被照抄成 SSID/密码的一部分
+    ESP_LOGI(TAG, "  配网命令示例: wifi_set MyAP 12345678（help 查看全部命令）");
 #endif
 
     ESP_LOGI(TAG, "初始化所有设备");

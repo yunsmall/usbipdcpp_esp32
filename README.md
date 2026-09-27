@@ -123,9 +123,9 @@ WiFi and device status are manageable at runtime. WiFi credentials are stored in
 Open `http://<ESP32_IP>/` in a browser (HTTP port 80):
 
 - **USB devices card** — attached devices with `busid`, `VID:PID` and usage state (idle / in use by a remote client). Auto-refreshes every 5 seconds.
-- **WiFi card** (collapsed by default) — current SSID/IP, change credentials (the device disconnects and reconnects to the new AP), plus a wiring hint for the fallback serial console. Empty password = open network.
+- **WiFi card** (collapsed by default) — current SSID/IP, change credentials (saved only once actually online, a failure keeps the previous config), plus a wiring hint for the fallback serial console. Empty password = open network.
 
-REST API: `GET /api/status` (connection state + config-port GPIOs), `GET /api/devices` (device list), `POST /api/wifi` (form-urlencoded `ssid=..&password=..`).
+REST API: `GET /api/status` (connection state + config-port GPIOs), `GET /api/devices` (device list), `POST /api/wifi` (form-urlencoded `ssid=..&password=..`; waits for the connection result — `{"ok":true,"ip":..}` and saved on success, `{"ok":false,"error":..}` and not saved on failure).
 
 ### Serial Console (when offline / misconfigured WiFi)
 
@@ -140,7 +140,7 @@ Wire a USB-UART adapter **crossed**: adapter RX → device TX, adapter TX → de
 
 | Command | Purpose |
 |---------|---------|
-| `wifi_set <ssid> [password]` | Set WiFi and reconnect (saved to NVS; omit password for an open network) |
+| `wifi_set <ssid> [password]` | Set WiFi and reconnect; **saved to NVS only once the AP is actually reached**, a failure keeps the previous config. Omit password for an open network |
 | `wifi_show` / `wifi_reset` | Show current config / clear NVS back to compile-time defaults |
 | `devices` | List attached USB devices (busid / VID:PID / usage state) |
 | `mem` | Print heap usage |
@@ -148,6 +148,10 @@ Wire a USB-UART adapter **crossed**: adapter RX → device TX, adapter TX → de
 | `about` | What this firmware is and how to manage it |
 
 The mirrored log stream is written with `\r\n` line endings so it renders correctly on real serial terminals.
+
+> `wifi_set` waits for the actual connection result, **up to 15 seconds**: the config is saved to NVS only once the AP is reached; a timeout, a wrong password or a missing AP saves nothing and keeps the previous config.
+>
+> The `<ssid>` / `[password]` in the command list is placeholder notation — **do not type the angle brackets or square brackets**. To connect to `MyAP` with password `12345678`, run `wifi_set MyAP 12345678` (quote the password if it contains spaces).
 
 ### Local Web Preview (no flashing)
 

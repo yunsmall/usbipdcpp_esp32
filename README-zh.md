@@ -123,9 +123,9 @@ WiFi 与设备状态都支持运行时管理。WiFi 凭据存 NVS（命名空间
 浏览器打开 `http://<ESP32_IP>/`（HTTP 端口 80）：
 
 - **USB 设备卡** — 当前接入的设备，显示 `busid`、`VID:PID` 与占用状态（空闲 / 被远程客户端使用）。每 5 秒自动刷新
-- **WiFi 卡**（默认折叠）— 当前 SSID/IP；修改凭据（设备会断开当前连接重连到新 AP）；配错网时串口救急的接线提示。密码留空 = 开放网络
+- **WiFi 卡**（默认折叠）— 当前 SSID/IP；修改凭据（连上才保存，失败保持原配置）；配错网时串口救急的接线提示。密码留空 = 开放网络
 
-REST API：`GET /api/status`（连接状态 + 配置口 GPIO）、`GET /api/devices`（设备列表）、`POST /api/wifi`（form-urlencoded：`ssid=..&password=..`）
+REST API：`GET /api/status`（连接状态 + 配置口 GPIO）、`GET /api/devices`（设备列表）、`POST /api/wifi`（form-urlencoded：`ssid=..&password=..`；同步等连接结果，成功返回 `{"ok":true,"ip":..}`，失败返回 `{"ok":false,"error":..}` 且不保存）
 
 ### 串口配置口（断网 / 配错 WiFi 时）
 
@@ -140,7 +140,7 @@ USB 转 TTL 串口线**交叉**接：适配器 RX → 设备 TX、适配器 TX �
 
 | 命令 | 作用 |
 |------|------|
-| `wifi_set <ssid> [password]` | 设置 WiFi 并重连（存 NVS；省略密码 = 开放网络） |
+| `wifi_set <ssid> [password]` | 设置 WiFi 并重连；**连上 AP 才存 NVS**，失败不保存。省略密码 = 开放网络 |
 | `wifi_show` / `wifi_reset` | 查看当前配置 / 清空 NVS 回编译期默认 |
 | `devices` | 列出已接入 USB 设备（busid / VID:PID / 占用状态） |
 | `mem` | 打印堆内存占用 |
@@ -148,6 +148,10 @@ USB 转 TTL 串口线**交叉**接：适配器 RX → 设备 TX、适配器 TX �
 | `about` | 固件简介 |
 
 镜像日志按 `\r\n` 行尾写出，真实串口终端上不会出现阶梯换行。
+
+> `wifi_set` 会等实际连接结果，**最多 15 秒**：连上才保存进 NVS；超时、密码错或找不到 AP 都不保存，继续用原配置。
+>
+> 命令里的 `<ssid>` / `[password]` 只是占位记法，**输入时不要带尖括号/方括号**——例如连 `MyAP`、密码 `12345678`，就输 `wifi_set MyAP 12345678`（密码含空格时用双引号包起来）。
 
 ### 网页本地预览（不用烧写）
 

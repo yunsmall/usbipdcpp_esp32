@@ -177,18 +177,34 @@ int cmd_wifi_set(int argc, char **argv)
     const int nerrors = arg_parse(argc, argv, reinterpret_cast<void **>(&s_wifi_set_args));
     if (nerrors != 0) {
         arg_print_errors(stderr, s_wifi_set_args.end, argv[0]);
+        // 用法串里的 <> [] 是占位记法，补个真实示例免得被照抄输入
+        printf("例: wifi_set MyAP 12345678（尖括号/方括号只是占位记号，输入时不带）\n");
         return 1;
     }
     // 密码含空格时用双引号包裹或反斜杠转义输入（esp_console 分词器支持，
     // 与 bash 规则一致）
     const char *password = s_wifi_set_args.password->count > 0 ? s_wifi_set_args.password->sval[0] : "";
-    esp_err_t err = WifiConfigManager::instance().apply_config(s_wifi_set_args.ssid->sval[0], password);
-    if (err != ESP_OK) {
-        printf("设置失败: %s\n", esp_err_to_name(err));
-        return 1;
+    const char *ssid = s_wifi_set_args.ssid->sval[0];
+
+    // apply_config 要等到实连结果（最长十几秒）才返回，先给提示免得像卡死
+    printf("正在连接 \"%s\"（最多等 %d 秒）...\n", ssid, WifiConfigManager::APPLY_TIMEOUT_SECONDS);
+    esp_err_t err = WifiConfigManager::instance().apply_config(ssid, password);
+    if (err == ESP_OK) {
+        printf("\n连接成功，配置已保存（重启后仍生效）\n");
+        return 0;
     }
-    printf("已设置并触发重连，重启后仍生效\n");
-    return 0;
+    // 失败：先一行说明原因，再一行说明配置的去向
+    if (err == ESP_ERR_TIMEOUT) {
+        printf("\n连接超时：%d 秒内没连上\n", WifiConfigManager::APPLY_TIMEOUT_SECONDS);
+    }
+    else if (err == ESP_FAIL) {
+        printf("\n连接失败：密码错误或找不到该 AP\n");
+    }
+    else {
+        printf("\n设置失败: %s\n", esp_err_to_name(err));
+    }
+    printf("配置未保存，继续使用原配置\n");
+    return 1;
 }
 
 int cmd_wifi_show(int argc, char **argv)
@@ -395,10 +411,10 @@ esp_err_t ConfigConsole::init()
     // argtable 参数声明（先于命令注册；结构体生命周期与命令一致）
     register_console_command_argtables();
 
+    // help 是 esp_console 列表里的一行，保持简短；真实示例放在参数报错时打印
     const esp_console_cmd_t wifi_set_cmd = {
             .command = "wifi_set",
-            .help = "设置 WiFi 配置并重连（NVS 持久化）: wifi_set <ssid> [password]，"
-                    "省略 password 视为开放网络",
+            .help = "设置 WiFi 并重连；连上 AP 才保存进 NVS，失败不保存。省略 password 即开放网络",
             .hint = nullptr, // argtable 非空时自动生成 hint
             .func = &cmd_wifi_set,
             .argtable = &s_wifi_set_args,

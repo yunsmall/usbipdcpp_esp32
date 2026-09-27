@@ -35,10 +35,22 @@ details.card[open]>summary::after{content:'收起 ▴'}
 .curinfo .row{display:flex;gap:10px;padding:2px 0;font-size:14px;line-height:1.5}
 .curinfo .label{flex:none;width:5em;color:#5a6470;font-size:13px}
 .curinfo .value{min-width:0;word-break:break-all}
-.msg{display:none;margin:14px 0 0;font-size:13px;line-height:1.6}
+/* 消息条：成功/失败两种配色，左侧色条 + 底色让结果一眼可辨；
+   pre-line 让文案里的 \n 生效，first-line 把首行加粗当标题用 */
+.msg{display:none;margin:14px 0 0;padding:10px 12px;border-radius:8px;
+    border-left:3px solid #c3c9d1;background:#f6f8fa;color:#5a6470;
+    font-size:13px;line-height:1.7;white-space:pre-line}
+.msg::first-line{font-weight:600}
+.msg.ok{background:#eaf7f0;border-left-color:#2f9e63;color:#1e7d4e}
+.msg.err{background:#fdecea;border-left-color:#d64545;color:#a5281f}
 /* 串口救急提示：配错 WiFi 断网后靠配置口 UART 重配，接线信息来自 /api/status */
-.hint{margin-top:16px;padding:10px 12px;border-radius:8px;background:#f6f8fa;font-size:13px;color:#5a6470;line-height:1.8}
-.hint code{background:#eceff3;padding:0 5px;border-radius:4px;color:#2b2f36;word-break:break-all}
+.hint{margin-top:16px;padding:12px 14px;border-radius:8px;background:#f6f8fa;font-size:13px;color:#5a6470;line-height:1.9}
+.hint-title{color:#2b2f36;font-weight:600}
+.hint-cmd{margin:8px 0;padding:6px 10px;border-radius:6px;background:#eceff3;
+    font-family:Consolas,Menlo,monospace;font-size:12.5px;color:#2b2f36}
+.hint-note{color:#8a9199;font-size:12px;line-height:1.7}
+.hint-row{margin-top:6px}
+.hint-row b{font-family:Consolas,Menlo,monospace;color:#2b2f36}
 .devbox{min-height:60px;font-size:14px}
 .none{color:#9aa3ad;text-align:center;padding:20px 0}
 table{width:100%;border-collapse:collapse}
@@ -49,6 +61,7 @@ td.mono{font-family:Consolas,Menlo,monospace}
 .badge.idle{background:#e6f6ee;color:#1e7d4e}
 .badge.busy{background:#fdf1e3;color:#b26a00}
 .foot{text-align:center;color:#9aa3ad;font-size:12px;margin-top:4px}
+.foot a{color:#5b7cfa}
 </style>
 </head>
 <body>
@@ -71,37 +84,42 @@ td.mono{font-family:Consolas,Menlo,monospace}
         <div class="row"><span class="label">SSID</span><span class="value" id="ssid_val"></span></div>
         <div class="row"><span class="label">IP 地址</span><span class="value" id="ip_val"></span></div>
       </div>
-      <p class="sub">修改会断开当前连接并重连</p>
+      <p class="sub">连上才保存，失败保持原配置（最长等 15 秒）</p>
       <label for="ssid">WiFi 名称（SSID）</label>
       <input id="ssid" placeholder="例如 my_wifi" spellcheck="false">
       <label for="password" class="mt">密码（开放网络留空）</label>
       <input id="password" type="password" placeholder="不填 = 开放网络">
-      <button onclick="saveWifi()">保存并重连</button>
+      <button id="savebtn" onclick="saveWifi()">保存并重连</button>
       <p id="msg" class="msg"></p>
       <!-- 救急路径：本页只能联网访问，配错 WiFi 断网时按此接线走串口重配。
            启用/未启用两种状态整块切换（见 refreshWifi） -->
       <div class="hint" id="hint_serial">
-        配错 WiFi 连不上本页时，用 USB 转 TTL 串口线（115200，GND 共地）接配置口，
-        在终端执行 <code>wifi_set &lt;SSID&gt; [password]</code> 重新配网
-        （<code>help</code> 查看全部命令）：
-        <div class="hint-row">TTL 的 RX → 本机 TX 脚：GPIO<span id="cfg_tx"></span></div>
-        <div class="hint-row">TTL 的 TX → 本机 RX 脚：GPIO<span id="cfg_rx"></span></div>
+        <div class="hint-title">配错 WiFi 连不上本页时，走串口救急</div>
+        <div>用 USB 转 TTL 串口线（115200，GND 共地）接配置口，终端里执行：</div>
+        <div class="hint-cmd">wifi_set MyAP 12345678</div>
+        <div class="hint-note">help 看全部命令；&lt;SSID&gt; [password] 只是占位记号，输入时不带</div>
+        <div class="hint-row">TTL 的 RX → 本机 TX 脚：<b>GPIO<span id="cfg_tx"></span></b></div>
+        <div class="hint-row">TTL 的 TX → 本机 RX 脚：<b>GPIO<span id="cfg_rx"></span></b></div>
       </div>
       <div class="hint" id="hint_noserial" style="display:none">
-        配置口 UART 未编译进本固件（Kconfig 的 USBIPD_CFG_CONSOLE_ENABLE 关闭），
-        无法用串口命令行救急——需重新编译开启该功能，或换一个能连上的 WiFi 后回来配置
+        <div class="hint-title">串口救急不可用</div>
+        <div>配置口 UART 没编译进本固件（Kconfig 的 USBIPD_CFG_CONSOLE_ENABLE 关闭），
+          需重新编译开启，或先换一个能连上的 WiFi 再回来配置</div>
       </div>
     </div>
   </details>
-  <p class="foot">设备列表每 5 秒自动刷新</p>
+  <p class="foot">设备列表每 5 秒自动刷新 ·
+    <a href="https://github.com/yunsmall/usbipdcpp_esp32" target="_blank" rel="noopener">项目主页（README / 使用说明）</a></p>
 </div>
 
 <script>
-function setMsg(text, ok) {
+// kind：'ok' 成功（绿）/ 'err' 失败（红）/ 省略 = 中性（灰：进行中或信息提示）
+function setMsg(text, kind) {
     const m = document.getElementById('msg');
+    // 配色与左侧色条走 .ok / .err（见样式表），这里只切类名
+    m.className = 'msg' + (kind ? ' ' + kind : '');
     m.style.display = 'block';
     m.textContent = text;
-    m.style.color = ok ? '#1e7d4e' : '#c0392b';
 }
 
 async function refreshWifi() {
@@ -121,6 +139,8 @@ async function refreshWifi() {
             document.getElementById('cfg_rx').textContent = j.console_rx;
         }
     } catch (e) {
+        // 状态点一并复位：连不上设备时不能还留着上一次的绿点
+        document.getElementById('dot').style.background = '#c3c9d1';
         document.getElementById('st_val').textContent = '无法连接设备';
     }
 }
@@ -174,37 +194,45 @@ async function refreshDevices() {
 }
 
 async function saveWifi() {
-    const msg = document.getElementById('msg');
     const ssid = document.getElementById('ssid').value.trim();
     if (!ssid) {
-        setMsg('请填写 WiFi 名称', false);
+        setMsg('请填写 WiFi 名称', 'err');
         return;
     }
-    // 点击立即反馈：保存会断开当前网络重连，fetch 可能等不到响应，不能干等
-    // （否则设备已重连、页面却像没反应）；后续 fetch 结果再补充/覆盖提示
-    setMsg('正在保存并切换网络，页面会短暂失联…', true);
-    let r;
+    // 固件要等实连结果（最长 15 秒）才应答，期间禁用按钮防重复提交
+    const btn = document.getElementById('savebtn');
+    btn.disabled = true;
+    setMsg('正在连接，最长等 15 秒…');
+
+    const opts = {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'ssid=' + encodeURIComponent(ssid) +
+              '&password=' + encodeURIComponent(document.getElementById('password').value)
+    };
+    // 本端超时略大于固件的等待上限；老浏览器没有 AbortSignal.timeout 就不设，
+    // 一直等固件应答
+    if (typeof AbortSignal.timeout === 'function') {
+        opts.signal = AbortSignal.timeout(20000);
+    }
+
+    let j;
     try {
-        r = await fetch('/api/wifi', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-            body: 'ssid=' + encodeURIComponent(ssid) +
-                  '&password=' + encodeURIComponent(document.getElementById('password').value)
-        });
+        j = await (await fetch('/api/wifi', opts)).json();
     } catch (e) {
-        // 服务端先应答再断网，正常能收到；仍失败说明此刻已断网，
-        // 等轮询恢复后状态自会刷新
-        setMsg('已提交，设备正在重连（页面恢复后自动显示新状态）', true);
+        // 换到别的 AP 后本机 IP 变化，响应送不到旧连接属正常；配置是否已保存
+        // 取决于固件侧的连接结果，用新 IP 打开本页即可看到
+        setMsg('设备可能已切到新网络\n请用新 IP 重新打开本页查看结果');
+        btn.disabled = false;
         refreshWifi();
         return;
     }
-    let text;
-    try {
-        text = JSON.parse(await r.text()).error || '已保存，正在重连…';
-    } catch (e) {
-        text = '已保存，正在重连…';
+    btn.disabled = false;
+    if (j && j.ok) {
+        setMsg('连接成功，配置已保存' + (j.ip ? '\nIP: ' + j.ip : ''), 'ok');
+    } else {
+        setMsg('连接失败：' + ((j && j.error) || '未知错误') + '\n配置未保存，继续使用原配置', 'err');
     }
-    setMsg(text, r.ok);
     refreshWifi();
 }
 
