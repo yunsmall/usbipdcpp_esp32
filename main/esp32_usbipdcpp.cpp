@@ -27,22 +27,15 @@
 
 using namespace std;
 
-auto TAG = "tcpip_test";
+constexpr const char *TAG = "tcpip_test";
 
 constexpr std::uint16_t listening_port = 3240;
 
-esp_pthread_cfg_t create_config(const char *name, int core_id, int stack, int prio) {
-    auto cfg = esp_pthread_get_default_config();
-    cfg.thread_name = name;
-    cfg.pin_to_core = core_id;
-    cfg.stack_size = stack;
-    cfg.prio = prio;
-    return cfg;
-}
-
-std::thread usb_host_event_thread;
-
 void init_usb_host() {
+    // 事件线程对象放函数内 static：只是为了让 thread 对象活到进程结束（局部变量
+    // 析构时对 joinable 的线程会 terminate），除本函数外没人访问它
+    static std::thread usb_host_event_thread;
+
     ESP_LOGI(TAG, "Installing USB Host Library");
     usb_host_config_t host_config = {
             .skip_phy_setup = false,
@@ -108,8 +101,12 @@ void init_all() {
 
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
 
-    // WiFi 初始化 + 自动连接/重连（实现已拆到 WifiConnection）
-    WifiConnection::instance().start();
+    // WiFi 初始化 + 自动连接/重连（实现已拆到 WifiConnection）。
+    // 失败也继续往下走（USB/IP 与网页服务本身不受影响，而且连不上网时正需要靠
+    // 网页/串口配网），但要把后果说明白，别让"WiFi 静默不可用"变成排查噩梦
+    if (WifiConnection::instance().start() != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi 初始化失败：联网与配网热点都不可用（详见上面的错误）");
+    }
 
     init_usb_host();
 }
@@ -121,7 +118,10 @@ int thread_main() {
     // 追加）要在任何并发打日志之前装好（sinks() 裸引用 vector 运行中增删有 data
     // race，见 ConfigConsole.cpp UartMirrorSink 注释）。REPL 命令的 wifi set 真正
     // 执行发生在用户输入时，彼时 init_all 早已完成，顺序上无依赖
-    ConfigConsole::instance().init();
+    if (ConfigConsole::instance().init() != ESP_OK) {
+        // 配置口是 WiFi 连不上时唯一的救急通道，起不来得让开机日志把后果说清楚
+        ESP_LOGE(TAG, "配置口 console 启动失败：串口救急通道不可用（原因见上）");
+    }
 
     // 刷机后 WiFi 连不上时配置口串口是唯一救急入口，开机日志直接给出接线
     // 信息——引脚随板子/Kconfig 变化，只写在 README 里刷完机根本找不到
@@ -142,13 +142,29 @@ int thread_main() {
     // WiFi credential. If you need to verify the configured password for
     // debugging, read CONFIG_USBIPD_WIFI_PASSWORD from sdkconfig directly.
     ESP_LOGI(TAG, "连接wifi password: <redacted, length=%d>", (int)WifiConfigManager::instance().password().size());
+    // 没有串口线的人也能配网：连续连不上超时会自动开热点（见 WifiConnection 看门狗），
+    // 开机日志直接给出热点名和配网页地址——否则用户不知道设备自己会开热点。
+    // AP 模式下（见 wifi_mode 命令）行为不同：不连 WiFi、热点立即开
+    if (WifiConfigManager::instance().work_mode() == WifiConfigManager::WifiWorkMode::Ap) {
+        ESP_LOGI(TAG, "工作模式: AP —— 只做配网热点，不尝试连 WiFi");
+        ESP_LOGI(TAG, "连上热点 \"%s\" 后浏览器打开 http://192.168.4.1/ 配网（wifi_mode sta 可切回连 WiFi）",
+                 WifiConfigManager::instance().ap_ssid().c_str());
+    }
+    else {
+        ESP_LOGI(TAG, "工作模式: STA —— 连不上 WiFi %d 秒后自动开配网热点 \"%s\"，连上热点后浏览器打开 http://192.168.4.1/ 配网",
+                 WifiConfigManager::AP_FALLBACK_SECONDS,
+                 WifiConfigManager::instance().ap_ssid().c_str());
+    }
 
+    // 只在编译期放开了 trace 时才有效：CMakeLists 的 SPDLOG_ACTIVE_LEVEL 是
+    // SPDLOG_LEVEL_INFO（那里有注释掉的 TRACE 开关），trace/debug 调用已被编译掉，
+    // 想真看到 trace 日志得改那行重新编译
     spdlog::set_level(spdlog::level::trace);
 
     // HTTP 配置服务（绑定 0.0.0.0，WiFi 断/连不影响监听）
-    HttpConfigApi::instance().init();
-
-    asio::ip::tcp::endpoint listen_endpoint(asio::ip::tcp::v4(), listening_port);
+    if (HttpConfigApi::instance().init() != ESP_OK) {
+        ESP_LOGE(TAG, "HTTP 配置服务启动失败：网页配置不可用（原因见上）");
+    }
 
     // StringPool string_pool;
     //
@@ -202,7 +218,9 @@ int thread_main() {
     asio::ip::tcp::endpoint endpoint{asio::ip::tcp::v4(), listening_port};
     auto ec = server.start(endpoint);
     if (ec) [[unlikely]] {
-        ESP_LOGE(TAG, "服务器启动失败：{}", ec.message());
+        // ESP_LOG 是 printf 风格、不认 {} 占位（那是 spdlog 的写法），
+        // 之前这行只打出字面的 "{}"，把真正的原因吞了
+        ESP_LOGE(TAG, "服务器启动失败：%s", ec.message().c_str());
         return -1;
     }
 
@@ -213,14 +231,16 @@ int thread_main() {
     
     while (true) {
         std::this_thread::sleep_for(chrono::seconds(5));
+        // 全部强转 unsigned long：这些接口返回 uint32_t/size_t，和 %lu 严格匹配
+        // 才是可移植写法（ESP32 上宽度相同、实际不会出错，但 -Wformat 会告警）
         ESP_LOGI(TAG, "Free: %lu, Min: %lu, DMA free: %lu, DMA min: %lu, PSRAM free: %lu, PSRAM min: %lu, DMA max block: %lu",
-                 esp_get_free_heap_size(),
-                 esp_get_minimum_free_heap_size(),
-                 heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
-                 heap_caps_get_minimum_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
-                 heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-                 heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM),
-                 heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+                 static_cast<unsigned long>(esp_get_free_heap_size()),
+                 static_cast<unsigned long>(esp_get_minimum_free_heap_size()),
+                 static_cast<unsigned long>(heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned long>(heap_caps_get_minimum_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned long>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                 static_cast<unsigned long>(heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM)),
+                 static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)));
     }
 
     server.stop();
@@ -233,8 +253,9 @@ extern "C" void app_main(void) {
     // spdlog 的并发安全依赖 pthread 原语（mutex/guard/once），而 pthread 环境只对
     // pthread_create 创建的任务完整注册——app_main 的 main task 不是 pthread 创建的，
     // 直接在 main task 里跑 thread_main（首次打 spdlog 日志即初始化并发原语）会崩
-    // （实测）。join 让 main task 保持存活，app_main 不返回
-    std::thread main_thread([&]() {
+    // （实测）。join 在这里实际永不返回（thread_main 自己 while(true)），作用是让
+    // app_main 不退出、main task 常驻
+    std::thread main_thread([]() {
         ESP_LOGI(TAG, "启动主线程main函数");
         thread_main();
     });

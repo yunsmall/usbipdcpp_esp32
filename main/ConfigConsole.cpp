@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 
 #include <argtable3/argtable3.h>
@@ -19,6 +20,7 @@
 
 #include "esp32_handler/Esp32Server.h"
 #include "WifiConfigManager.h"
+#include "WifiConnection.h"
 #include "sdkconfig.h"
 
 namespace
@@ -26,8 +28,19 @@ namespace
 
 constexpr const char *TAG = "ConfigConsole";
 
-// 日志镜像总开关：esp_log hook 与 spdlog sink 都检查它，logs 命令翻转
+// 日志镜像总开关：esp_log hook 与 spdlog sink 都检查它，logs 命令翻转。
+// relaxed 是刻意的：它只决定"这一行要不要镜像"，不承担同步职责——读到旧值
+// 最多让切换瞬间多/少镜像一行，没有别的数据依赖它
 std::atomic<bool> s_log_mirror_enabled{false};
+
+// 配置口写入互斥：两条镜像路径（esp_log hook、spdlog sink）来自不同线程、
+// 写的是同一个 UART，而 uart_write_bytes 的互斥只在单次调用内部——不串行化的
+// 话，补 \r 拆出的多段写会和另一线程的日志交错成半行。锁只在镜像开启时才被
+// 碰到，代价可忽略。
+// 前提与本文件其它日志处理一致：日志都在任务上下文——ESP_LOGx 本来就禁止在
+// ISR 里调用（ISR 要打日志得走 ESP_EARLY_LOGx，那条路径直接走 ROM 输出，
+// 不经过 esp_log_set_vprintf 装的 hook），所以这里拿锁是安全的
+std::mutex s_mirror_write_mutex;
 
 // 行尾规范化后写配置口（esp_log hook 路径专用；spdlog 路径见 init 里镜像 sink
 // 的 formatter eol 说明，不经过这里）。esp_log 的格式串行尾是裸 \n（无 \r），
@@ -78,6 +91,7 @@ protected:
         formatter_->format(msg, formatted);
         // REPL 启动后 driver 必已安装（esp_console_new_repl_uart 内部安装）；
         // 失败静默丢弃，不影响主日志通道
+        std::lock_guard lock(s_mirror_write_mutex);
         uart_write_bytes(port_, formatted.data(), formatted.size());
     }
 
@@ -103,7 +117,9 @@ ConfigConsole &ConfigConsole::instance()
 
 int ConfigConsole::mirror_log_vprintf(const char *fmt, va_list args)
 {
-    // UART0 输出保持原样：调 esp_log_set_vprintf 返回的原实现
+    // UART0 输出保持原样：调 esp_log_set_vprintf 返回的原实现。
+    // 只 va_end 自己 va_copy 出来的复制品：args 是调用方 va_start 出来的，
+    // 归调用方 va_end（对同一条 va_list 二次 end 是未定义行为）
     int ret = 0;
     if (s_orig_log_vprintf != nullptr) {
         va_list args_uart0;
@@ -115,14 +131,29 @@ int ConfigConsole::mirror_log_vprintf(const char *fmt, va_list args)
     if (s_log_mirror_enabled.load(std::memory_order_relaxed)) {
         va_list args_mirror;
         va_copy(args_mirror, args);
+        // 缓冲不加大是刻意的：本函数跑在打日志那条线程自己的栈上，512B 数组曾把
+        // nio 这类小栈线程压爆（见 uart_write_normalized 注释），超长行只能截断
         char buf[256];
         const int len = std::vsnprintf(buf, sizeof(buf), fmt, args_mirror);
         va_end(args_mirror);
         if (len > 0) {
-            // 镜像口写满整行（一行日志不会超过 255 字节，截断只影响单行显示）
-            const std::size_t to_write = static_cast<std::size_t>(len) < sizeof(buf)
-                                                 ? static_cast<std::size_t>(len)
-                                                 : sizeof(buf) - 1;
+            std::size_t to_write = static_cast<std::size_t>(len) < sizeof(buf)
+                                           ? static_cast<std::size_t>(len)
+                                           : sizeof(buf) - 1;
+            if (static_cast<std::size_t>(len) >= sizeof(buf)) {
+                // 超长行被截断：尾部换成 "..." + 换行——既提示"这行还有内容没显
+                // 示"，也把行收干净（残行不带换行符的话，下一条日志会接在它后面，
+                // 看着像丢了行）
+                // 落点按"写入上界（buf-1）往前退 tail_len"算：拷贝范围与写入
+                // 范围严格错开，不碰 buf 末尾的终止符
+                static constexpr char tail[] = "...\n";
+                constexpr std::size_t tail_len = sizeof(tail) - 1; // 不含终止符
+                std::memcpy(buf + (sizeof(buf) - 1) - tail_len, tail, tail_len);
+                to_write = sizeof(buf) - 1;
+            }
+            // 与 spdlog 那条镜像路径以及其它线程的 ESP_LOG 互斥：本函数可能把
+            // 一行拆成多段写（补 \r），不串行化会在镜像口交错成半行
+            std::lock_guard lock(s_mirror_write_mutex);
             uart_write_normalized(s_config_uart_port, buf, to_write);
         }
     }
@@ -141,7 +172,7 @@ void ConfigConsole::set_server(usbipdcpp::Esp32Server *server)
 
 usbipdcpp::Esp32Server *ConfigConsole::server() const
 {
-    return esp32_server_;
+    return esp32_server_.load();
 }
 
 // ========== REPL 命令（argtable3 声明参数，esp_console 惯例见 IDF cmd_nvs 示例） ==========
@@ -158,6 +189,25 @@ struct WifiSetArgs
 
 WifiSetArgs s_wifi_set_args = {};
 
+// ap_set：配网热点的名称与密码（密码可选，缺省 = 开放热点）
+struct ApSetArgs
+{
+    struct arg_str *ssid;
+    struct arg_str *password;
+    struct arg_end *end;
+};
+
+ApSetArgs s_ap_set_args = {};
+
+// wifi_mode：期望的工作模式（可选参数，省略 = 只看不改）
+struct WifiModeArgs
+{
+    struct arg_str *mode;
+    struct arg_end *end;
+};
+
+WifiModeArgs s_wifi_mode_args = {};
+
 // wifi_show / wifi_reset / logs / about / devices / mem：无参数命令也带 argtable
 // （只含 arg_end），解析器会拦截多余参数并打印 usage
 struct WifiShowArgs
@@ -171,6 +221,15 @@ WifiShowArgs s_logs_args = {};
 WifiShowArgs s_about_args = {};
 WifiShowArgs s_devices_args = {};
 WifiShowArgs s_mem_args = {};
+
+// arg_parse 把"结构体地址"当 void*[] 遍历（IDF 示例 .argtable = &结构体 的传统
+// 写法）：前提是成员按声明顺序紧排、无填充。下面把这个前提变成编译期检查——成员
+// 全是同尺寸的指针，sizeof 等于成员数×sizeof(void*) 就说明没有填充；哪天不成立
+// （换编译器、给结构体加了别的成员）编译直接失败，不会运行时读错参数表
+static_assert(sizeof(WifiSetArgs) == 3 * sizeof(void *));
+static_assert(sizeof(ApSetArgs) == 3 * sizeof(void *));
+static_assert(sizeof(WifiModeArgs) == 2 * sizeof(void *));
+static_assert(sizeof(WifiShowArgs) == 1 * sizeof(void *));
 
 int cmd_wifi_set(int argc, char **argv)
 {
@@ -207,6 +266,77 @@ int cmd_wifi_set(int argc, char **argv)
     return 1;
 }
 
+// ap_set：设置配网热点的名称/密码（存 NVS，下次热点启动时生效）
+int cmd_ap_set(int argc, char **argv)
+{
+    const int nerrors = arg_parse(argc, argv, reinterpret_cast<void **>(&s_ap_set_args));
+    if (nerrors != 0) {
+        arg_print_errors(stderr, s_ap_set_args.end, argv[0]);
+        printf("例: ap_set usbipd-setup 12345678（密码留空 = 开放热点）\n");
+        return 1;
+    }
+    const char *password = s_ap_set_args.password->count > 0 ? s_ap_set_args.password->sval[0] : "";
+    const char *ssid = s_ap_set_args.ssid->sval[0];
+    esp_err_t err = WifiConfigManager::instance().apply_ap_config(ssid, password);
+    if (err != ESP_OK) {
+        printf("\n设置失败: %s\n", esp_err_to_name(err));
+        printf("热点密码要么留空（开放），要么 8~63 位\n");
+        return 1;
+    }
+    printf("\n配网热点配置已保存：\"%s\"（%s）\n", ssid,
+           password[0] == '\0' ? "开放网络" : "WPA2 加密");
+    if (WifiConnection::instance().is_ap_active()) {
+        printf("当前热点仍用旧配置，下次开热点时生效\n");
+    }
+    else {
+        printf("等设备连不上 WiFi 时会自动用它开热点，连上后访问 http://192.168.4.1/ 配网\n");
+    }
+    return 0;
+}
+
+// wifi_mode：查看/设置期望的工作模式（存 NVS，重启后沿用）
+int cmd_wifi_mode(int argc, char **argv)
+{
+    const int nerrors = arg_parse(argc, argv, reinterpret_cast<void **>(&s_wifi_mode_args));
+    if (nerrors != 0) {
+        arg_print_errors(stderr, s_wifi_mode_args.end, argv[0]);
+        printf("例: wifi_mode ap（只做配网热点）/ wifi_mode sta（连接 WiFi）\n");
+        return 1;
+    }
+    auto &manager = WifiConfigManager::instance();
+    if (s_wifi_mode_args.mode->count == 0) {
+        if (manager.work_mode() == WifiConfigManager::WifiWorkMode::Ap) {
+            printf("当前工作模式: ap（只做配网热点，不连 WiFi）\n");
+        }
+        else {
+            printf("当前工作模式: sta（连 WiFi；连不上 %d 秒后自动开配网热点）\n",
+                   WifiConfigManager::AP_FALLBACK_SECONDS);
+        }
+        return 0;
+    }
+
+    const std::string mode_str = s_wifi_mode_args.mode->sval[0];
+    WifiConfigManager::WifiWorkMode mode;
+    if (!WifiConfigManager::parse_work_mode(mode_str, mode)) {
+        printf("未知模式 \"%s\"：只接受 sta 或 ap\n", mode_str.c_str());
+        return 1;
+    }
+
+    const esp_err_t err = manager.set_work_mode(mode);
+    if (err != ESP_OK) {
+        printf("设置失败: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    if (mode == WifiConfigManager::WifiWorkMode::Ap) {
+        printf("已切到 AP 模式（存 NVS，重启后沿用）：不再尝试连 WiFi，配网热点随即开启\n");
+    }
+    else {
+        printf("已切到 STA 模式（存 NVS，重启后沿用）：正在尝试连接 \"%s\"\n",
+               manager.ssid().c_str());
+    }
+    return 0;
+}
+
 int cmd_wifi_show(int argc, char **argv)
 {
     const int nerrors = arg_parse(argc, argv, reinterpret_cast<void **>(&s_wifi_show_args));
@@ -217,10 +347,17 @@ int cmd_wifi_show(int argc, char **argv)
     auto &manager = WifiConfigManager::instance();
     const std::string ssid = manager.ssid();
     const std::string ip = manager.ip_str();
+    printf("工作模式: %s\n", manager.work_mode() == WifiConfigManager::WifiWorkMode::Ap
+                                    ? "ap（只做配网热点，不连 WiFi）"
+                                    : "sta（连接 WiFi）");
     printf("当前配置 SSID: %s\n", ssid.c_str());
     printf("密码: %s\n", manager.password().empty() ? "<空（开放网络）>" : "********");
     printf("连接状态: %s\n", manager.is_connected() ? "已连接" : "未连接");
     printf("IP: %s\n", ip.empty() ? "<无>" : ip.c_str());
+    // 配网热点：连不上时用户最需要知道的两件事——热点叫什么、开没开
+    printf("配网热点: %s（%s）\n", manager.ap_ssid().c_str(),
+           WifiConnection::instance().is_ap_active() ? "运行中，浏览器访问 http://192.168.4.1/"
+                                                     : "未启动，连不上 WiFi 时自动开");
     return 0;
 }
 
@@ -236,7 +373,7 @@ int cmd_wifi_reset(int argc, char **argv)
         printf("重置失败: %s\n", esp_err_to_name(err));
         return 1;
     }
-    printf("已清除 NVS 记录，当前内存配置回退编译期默认（重启后生效），当前连接不变\n");
+    printf("已清除 NVS 记录（含配网热点配置），内存配置回退编译期默认，当前连接不变\n");
     return 0;
 }
 
@@ -248,10 +385,14 @@ int cmd_logs(int argc, char **argv)
         return 1;
     }
     // REPL 命令执行期间不处理输入（阻塞在 esp_console_run），ctrl-C 只留在 RX 缓冲，
-    // 因此本命令自行轮询配置口 RX 收 0x03 作为退出信号
+    // 因此本命令自行轮询配置口 RX 收 0x03 作为退出信号。
+    // 依赖 esp_console 当前的行为（命令在 REPL 任务里同步执行、期间不读 RX）；
+    // 若哪天 REPL 改成边执行边收输入，这里就会与它抢 RX，得改成事件通知退出
     uart_flush_input(s_config_uart_port);
-    ConfigConsole::set_log_mirror(true);
+    // 提示先于开关：printf 直接写配置口、不走镜像那把锁（s_mirror_write_mutex），
+    // 先开镜像的话这行提示可能和别的线程的日志交错成半行
     printf("日志镜像已开启（UART0 日志同时显示在此口），按 Ctrl-C 停止\n");
+    ConfigConsole::set_log_mirror(true);
 
     uint8_t byte = 0;
     while (true) {
@@ -285,8 +426,11 @@ int cmd_about(int argc, char **argv)
             "管理接口：\n"
             "  help            查看全部命令\n"
             "  wifi_set/show/reset  配网（存 NVS，断电不丢）\n"
+            "  ap_set          设置配网热点名称/密码（连不上 WiFi 时自动开热点）\n"
+            "  wifi_mode       查看/设置工作模式：sta=连 WiFi，ap=只做配网热点\n"
             "  logs            实时查看主串口日志，Ctrl-C 退出\n"
-            "联网后也可用浏览器打开 http://<本机IP>/ 页面配网\n");
+            "联网后也可用浏览器打开 http://<本机IP>/ 页面配网；\n"
+            "连不上 WiFi 时设备自己开热点，手机/电脑连上后打开 http://192.168.4.1/ 配网\n");
     return 0;
 }
 
@@ -311,8 +455,10 @@ int cmd_devices(int argc, char **argv)
     }
     // 空闲设备在前、被客户端占用的在后（见 list_device_snapshots）
     for (const auto &device: devices) {
-        printf("%-8s VID:PID=%04x:%04x  %s\n", device.busid.c_str(), device.vendor_id,
-               device.product_id, device.in_use ? "使用中（已被远程占用）" : "空闲（可共享）");
+        printf("%-8s VID:PID=%04x:%04x  %s\n", device.busid.c_str(),
+               static_cast<unsigned>(device.vendor_id),
+               static_cast<unsigned>(device.product_id),
+               device.in_use ? "使用中（已被远程占用）" : "空闲（可共享）");
     }
     return 0;
 }
@@ -345,6 +491,14 @@ void register_console_command_argtables()
     s_wifi_set_args.password = arg_str0(nullptr, nullptr, "[password]", "密码，开放网络省略");
     s_wifi_set_args.end = arg_end(2);
 
+    s_ap_set_args.ssid = arg_str1(nullptr, nullptr, "<ssid>", "配网热点名称");
+    s_ap_set_args.password = arg_str0(nullptr, nullptr, "[password]", "密码（至少 8 位），开放热点省略");
+    s_ap_set_args.end = arg_end(2);
+
+    s_wifi_mode_args.mode = arg_str0(nullptr, nullptr, "[sta|ap]",
+                                     "工作模式：sta=连 WiFi，ap=只做配网热点（省略则显示当前模式）");
+    s_wifi_mode_args.end = arg_end(2);
+
     s_wifi_show_args.end = arg_end(2);
     s_wifi_reset_args.end = arg_end(2);
     s_logs_args.end = arg_end(2);
@@ -360,7 +514,19 @@ esp_err_t ConfigConsole::init()
 #if !CONFIG_USBIPD_CFG_CONSOLE_ENABLE
     return ESP_OK;
 #endif
+    // 幂等：重复执行会把上一轮装好的镜像钩子当成"原 vprintf"再存一次，
+    // mirror_log_vprintf 于是调到自己——一打日志就无限递归、栈溢出；镜像 sink
+    // 也会被重复挂进 logger。首次结果存下来，重复调用直接返回它。
+    // 失败也不重试（call_once 的语义）：REPL 起不来的原因（UART 号/引脚冲突）
+    // 在 Kconfig 里，运行中重试没有意义，所以刻意不留重试路径
+    static std::once_flag init_once;
+    static esp_err_t init_result = ESP_OK;
+    std::call_once(init_once, [] { init_result = init_repl_and_mirror(); });
+    return init_result;
+}
 
+esp_err_t ConfigConsole::init_repl_and_mirror()
+{
     s_config_uart_port = static_cast<uart_port_t>(CONFIG_USBIPD_CFG_UART_NUM);
 
     // ---------- 日志镜像钩子（必须在大量日志开始前安装） ----------
@@ -368,8 +534,10 @@ esp_err_t ConfigConsole::init()
     // 避免与并发打日志形成 data race（见 UartMirrorSink 类注释）
     auto logger = spdlog::default_logger();
     if (logger == nullptr) {
-        // spdlog 尚未初始化（正常路径不会发生：项目代码启动即打日志），
-        // 跳过 spdlog 镜像，ESP_LOG 镜像不受影响
+        // 防御分支：default_logger() 由 spdlog registry 构造时建好，正常不为空
+        // （除非启用编译宏 SPDLOG_DISABLE_DEFAULT_LOGGER，或有人显式
+        // set_default_logger(nullptr)——本项目两者都没有）；真为空也只是少这条
+        // 镜像通道，ESP_LOG 镜像不受影响
         ESP_LOGW(TAG, "spdlog default logger 不可用，spdlog 日志不会镜像");
     }
     else {
@@ -386,6 +554,11 @@ esp_err_t ConfigConsole::init()
     s_orig_log_vprintf = esp_log_set_vprintf(&ConfigConsole::mirror_log_vprintf);
 
     // ---------- REPL ----------
+    // 命令里的 printf 会写到配置口、不是 UART0：REPL 任务启动时发现本口不是
+    // CONFIG_ESP_CONSOLE_UART_NUM，会把自己任务的 stdin/stdout/stderr 重定向到
+    // /dev/uart/<本口>（IDF console 组件 esp_console_common.c 的 esp_console_repl_task），
+    // 而命令正是在那个任务里执行的；ESP-IDF 的 newlib 里这三个流按任务记录，
+    // 其它任务（UART0 日志等）不受影响
     esp_console_repl_config_t repl_config = {};
     repl_config.max_history_len = 8;
     repl_config.max_cmdline_length = 256;
@@ -405,9 +578,17 @@ esp_err_t ConfigConsole::init()
         ESP_LOGE(TAG, "REPL 创建失败（UART%d, tx=%d, rx=%d）: %s",
                  CONFIG_USBIPD_CFG_UART_NUM, CONFIG_USBIPD_CFG_UART_TX_GPIO,
                  CONFIG_USBIPD_CFG_UART_RX_GPIO, esp_err_to_name(err));
+        // 上面装好的镜像钩子故意不撤：镜像开关默认是关的，REPL 没起来就没人能
+        // 打开它（logs 命令不存在）；撤销反而要在"可能正被并发打日志"的路径上
+        // 动 sinks()，风险比收益大
         return err;
     }
 
+    // 从这里起的失败路径都不回收 repl 句柄：IDF 的清理入口 repl->del（即
+    // esp_console_stop_repl）要求 REPL 已经 start 过——未启动时它内部会因
+    // s_interrupt_reading_fd 还没就绪提前返回，照样不释放（见 esp_console_repl_
+    // internal.c 的 esp_console_common_deinit）。加上本函数被 call_once 保护、
+    // 只执行一次，走到这里失败设备本来就该重启，不值得为它写一段不生效的伪清理
     // argtable 参数声明（先于命令注册；结构体生命周期与命令一致）
     register_console_command_argtables();
 
@@ -424,6 +605,36 @@ esp_err_t ConfigConsole::init()
     err = esp_console_cmd_register(&wifi_set_cmd);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "注册 wifi_set 命令失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    const esp_console_cmd_t ap_set_cmd = {
+            .command = "ap_set",
+            .help = "设置配网热点的名称/密码（连不上 WiFi 时自动开启，存 NVS）",
+            .hint = nullptr,
+            .func = &cmd_ap_set,
+            .argtable = &s_ap_set_args,
+            .func_w_context = nullptr,
+            .context = nullptr,
+    };
+    err = esp_console_cmd_register(&ap_set_cmd);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "注册 ap_set 命令失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    const esp_console_cmd_t wifi_mode_cmd = {
+            .command = "wifi_mode",
+            .help = "查看/设置工作模式：sta=连 WiFi，ap=只做配网热点（存 NVS）",
+            .hint = nullptr,
+            .func = &cmd_wifi_mode,
+            .argtable = &s_wifi_mode_args,
+            .func_w_context = nullptr,
+            .context = nullptr,
+    };
+    err = esp_console_cmd_register(&wifi_mode_cmd);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "注册 wifi_mode 命令失败: %s", esp_err_to_name(err));
         return err;
     }
 
@@ -444,7 +655,7 @@ esp_err_t ConfigConsole::init()
 
     const esp_console_cmd_t wifi_reset_cmd = {
             .command = "wifi_reset",
-            .help = "清除 NVS 里的 WiFi 配置（下次开机回编译期默认）",
+            .help = "清除 NVS 里的 WiFi/配网热点配置（下次开机回编译期默认）",
             .hint = nullptr,
             .func = &cmd_wifi_reset,
             .argtable = &s_wifi_reset_args,

@@ -8,6 +8,19 @@ menu "Usbipdcpp WiFi Configuration"
         string "Usbipd WiFi Password"
         default "default_password"
 
+    config USBIPD_AP_SSID
+        string "Provisioning AP SSID"
+        default "usbipd-setup"
+        help
+            设备连不上 WiFi 时自己开出的配网热点名称（连上去用浏览器配网）。
+            运行中可用串口 ap_set 或网页改，改后存 NVS、优先于这里的默认值。
+
+    config USBIPD_AP_PASSWORD
+        string "Provisioning AP password"
+        default "12345678"
+        help
+            配网热点密码，至少 8 位（WPA2 要求）；留空 = 开放热点。
+
 endmenu
 
 menu "Usbipdcpp Runtime Configuration"
@@ -32,6 +45,8 @@ menu "Usbipdcpp Runtime Configuration"
         default 4 if IDF_TARGET_ESP32P4
         help
             接 CH340 之类 USB-TTL 的 TX 引脚（ESP32 侧发送）。
+            默认值只覆盖本项目支持的 S3/P4；换其它目标时 Kconfig 取不到默认、
+            会得到 0，必须在这里手动指定。
 
     config USBIPD_CFG_UART_RX_GPIO
         int "Configuration console RX GPIO"
@@ -39,12 +54,15 @@ menu "Usbipdcpp Runtime Configuration"
         default 5 if IDF_TARGET_ESP32P4
         help
             接 CH340 之类 USB-TTL 的 RX 引脚（ESP32 侧接收）。
+            默认值只覆盖本项目支持的 S3/P4；换其它目标时 Kconfig 取不到默认、
+            会得到 0，必须在这里手动指定。
 
     config USBIPD_HTTPD_ENABLE
         bool "Enable HTTP configuration service"
         default y
         help
-            有网时通过 HTTP REST（GET /api/status、POST /api/wifi）改 WiFi 配置。
+            有网时通过 HTTP REST（GET /api/status、POST /api/wifi、POST /api/ap）
+            改 WiFi 与配网热点配置。
             无鉴权：与 usbip 服务同信任模型（局域网内均可访问）。
 
     config USBIPD_HTTPD_PORT

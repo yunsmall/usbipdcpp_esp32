@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include <esp_err.h>
 #include <esp_http_server.h>
 
@@ -16,11 +18,14 @@ namespace usbipdcpp
  *
  * 路由：
  *   GET  /            网页（main/web/index.html，EMBED_FILES 嵌入，见 CMakeLists）
- *   GET  /api/status  {"connected":..,"ssid":"..","stored":..,"ip":".."}
+ *   GET  /api/status  {"connected":..,"ssid":"..,"ip":"..","console_tx":..,"console_rx":..,
+ *                      "ap_active":..,"ap_ssid":"..","ap_auth":..,"work_mode":"sta|ap"}
  *   GET  /api/devices {"devices":[{"busid":"1-1","vid":"046d","pid":"c077","in_use":..},..]}
  *                     设备列表与占用状态（由 esp32_usbipdcpp.cpp 挂接的 Esp32Server 提供）
  *   POST /api/wifi    form-urlencoded: ssid=..&password=..（空 password=开放 AP），
  *                     成功后应用新配置，当前连接会被断开重连
+ *   POST /api/ap      同上的字段，改配网热点的名称/密码（只存 NVS，下次热点启动时生效）
+ *   POST /api/mode    form-urlencoded: mode=sta|ap，切换期望工作模式（存 NVS，立即生效）
  */
 class HttpConfigApi
 {
@@ -50,9 +55,12 @@ private:
     static esp_err_t handle_get_status(httpd_req_t *req);
     static esp_err_t handle_get_devices(httpd_req_t *req);
     static esp_err_t handle_post_wifi(httpd_req_t *req);
+    static esp_err_t handle_post_ap(httpd_req_t *req);
+    static esp_err_t handle_post_mode(httpd_req_t *req);
 
     httpd_handle_t server_ = nullptr;
 
-    // 挂接的 usbip 服务器（nullptr = 尚未挂接，/api/devices 返回空列表）
-    usbipdcpp::Esp32Server *esp32_server_ = nullptr;
+    // 挂接的 usbip 服务器（nullptr = 尚未挂接，/api/devices 返回空列表）。
+    // 启动线程写、httpd 任务读，用原子指针免得构成 data race
+    std::atomic<usbipdcpp::Esp32Server *> esp32_server_{nullptr};
 };

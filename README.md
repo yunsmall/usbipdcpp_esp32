@@ -21,6 +21,7 @@ English | [中文](README-zh.md)
 - ⚡ **Zero-Copy Performance** - Direct DMA buffer access eliminates data copying overhead, achieving optimal throughput
 - 🛡️ **Robust Connection Handling** - Automatic cleanup when devices are unplugged during active sessions
 - 🖥️ **Runtime WiFi Configuration** - Change WiFi over a web UI or a dedicated serial console; credentials persist in NVS across reboots — no recompilation needed
+- 📡 **Provisioning AP** - When it cannot reach WiFi, the device raises its own hotspot; connect a phone/laptop, open `http://192.168.4.1/` and configure — no serial adapter needed
 - 📊 **Device Status Panel** - Web UI and serial console list attached devices (busid, VID:PID, remote-client usage)
 
 ## 📋 Requirements
@@ -122,10 +123,32 @@ WiFi and device status are manageable at runtime. WiFi credentials are stored in
 
 Open `http://<ESP32_IP>/` in a browser (HTTP port 80):
 
-- **USB devices card** — attached devices with `busid`, `VID:PID` and usage state (idle / in use by a remote client). Auto-refreshes every 5 seconds.
-- **WiFi card** (collapsed by default) — current SSID/IP, change credentials (saved only once actually online, a failure keeps the previous config), plus a wiring hint for the fallback serial console. Empty password = open network.
+The page opens with a status bar (connection state, SSID, IP, whether the provisioning hotspot is running). On narrow screens three tabs split the content — no scrolling through a long page; from 880px wide the tabs give way to a two-column layout with everything on screen at once:
 
-REST API: `GET /api/status` (connection state + config-port GPIOs), `GET /api/devices` (device list), `POST /api/wifi` (form-urlencoded `ssid=..&password=..`; waits for the connection result — `{"ok":true,"ip":..}` and saved on success, `{"ok":false,"error":..}` and not saved on failure).
+- **USB devices** — attached devices with `busid`, `VID:PID` and usage state (idle / in use by a remote client). Auto-refreshes every 5 seconds.
+- **WiFi** — work mode switch (STA connects to WiFi / AP provisioning hotspot only; takes effect on click); change credentials (saved only once actually online, a failure keeps the previous config); the serial-console rescue wiring hint is folded away. Empty password = open network.
+- **Provisioning AP** — hotspot name/password (stored in NVS; the name field is pre-filled with the current value and the password field notes whether one is set — the password itself never reaches the browser); the device raises this hotspot when it cannot reach WiFi, connect to it and open `http://192.168.4.1/` to configure.
+
+While the provisioning hotspot is running, a banner appears at the top; on narrow screens the page also switches to the WiFi tab automatically.
+
+REST API: `GET /api/status` (connection state + config-port GPIOs + hotspot state and work mode), `GET /api/devices` (device list), `POST /api/wifi` (form-urlencoded `ssid=..&password=..`; waits for the connection result — `{"ok":true,"ip":..}` and saved on success, `{"ok":false,"error":..}` and not saved on failure), `POST /api/ap` (same fields, sets the provisioning hotspot name/password), `POST /api/mode` (`mode=sta|ap` switches the work mode immediately).
+
+### Provisioning AP (configure without a serial adapter)
+
+In the default **STA work mode**, if the device fails to reach WiFi for **30 seconds** straight after boot (wrong password, router gone, moved elsewhere), it raises its own provisioning hotspot. The STA side keeps retrying in the background — the hotspot is temporary and **shuts down automatically once WiFi connects**, returning to plain STA.
+
+Connect a phone/laptop to that hotspot (default `usbipd-setup` / `12345678`; change the defaults via Kconfig `USBIPD_AP_SSID` / `USBIPD_AP_PASSWORD`), open `http://192.168.4.1/` and you get the same management page: a banner at the top says you are in provisioning mode, fill in the WiFi name/password and save. Once connected, the hotspot disappears — use the new IP from then on.
+
+Hotspot name and password can be changed at any time from the **Provisioning AP card** in the web UI, or `ap_set` over serial (see table below). Both only store the config, **effective the next time the hotspot starts** (the running hotspot is left alone — no kicking a client that is halfway through provisioning). Empty password = open hotspot; otherwise at least 8 characters.
+
+**Work mode** (stored in NVS; switch from the web UI's WiFi tab or `wifi_mode` over serial — effective immediately, kept across reboots):
+
+| Mode | Behaviour |
+|------|-----------|
+| `sta` (default) | Connects to WiFi; after 30 seconds without success it raises the provisioning hotspot and **keeps retrying in the background** (if the old AP comes back it reconnects and drops the hotspot) |
+| `ap` | Provisioning hotspot only: **no WiFi connection, no retries** (for places with no target network — avoids endless scanning and log spam) |
+
+After you provision WiFi successfully while in `ap` mode, the mode falls back to `sta` automatically — otherwise the next reboot would go back to hotspot-only and your freshly configured network would be ignored.
 
 ### Serial Console (when offline / misconfigured WiFi)
 
@@ -141,7 +164,9 @@ Wire a USB-UART adapter **crossed**: adapter RX → device TX, adapter TX → de
 | Command | Purpose |
 |---------|---------|
 | `wifi_set <ssid> [password]` | Set WiFi and reconnect; **saved to NVS only once the AP is actually reached**, a failure keeps the previous config. Omit password for an open network |
-| `wifi_show` / `wifi_reset` | Show current config / clear NVS back to compile-time defaults |
+| `wifi_show` / `wifi_reset` | Show current config (incl. provisioning hotspot and work mode) / clear NVS back to compile-time defaults |
+| `ap_set <ssid> [password]` | Set the provisioning hotspot name/password (stored in NVS, effective next time the hotspot starts). Omit password for an open hotspot |
+| `wifi_mode [sta\|ap]` | Show/set the work mode (stored in NVS): `sta` = connect to WiFi, `ap` = provisioning hotspot only |
 | `devices` | List attached USB devices (busid / VID:PID / usage state) |
 | `mem` | Print heap usage |
 | `logs` | Mirror the main UART0 log stream to the config port (Ctrl-C to stop) |
@@ -155,7 +180,7 @@ The mirrored log stream is written with `\r\n` line endings so it renders correc
 
 ### Local Web Preview (no flashing)
 
-The web UI is a single static file (`main/web/index.html`) embedded at compile time. To iterate on layout/scripts without flashing the firmware: run `python main/web/mock_server.py` and open `http://127.0.0.1:8000`. The mock serves fake `/api/status` and `/api/devices` responses; edit the top of the script to preview different states (disconnected, disabled config port, long SSID…).
+The web UI is a single static file (`main/web/index.html`) embedded at compile time. To iterate on layout/scripts without flashing the firmware: run `python main/web/mock_server.py` and open `http://127.0.0.1:8000`. The mock serves fake `/api/status` and `/api/devices` responses; edit the top of the script to preview different states (disconnected, disabled config port, long SSID, provisioning mode via `ap_active=True`…).
 
 ## 🏗️ Architecture
 

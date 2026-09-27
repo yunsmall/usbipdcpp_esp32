@@ -8,91 +8,202 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>usbipdcpp 管理面板</title>
 <style>
-body{font-family:'Microsoft YaHei','Segoe UI',sans-serif;background:#eef1f5;margin:0;color:#2b2f36}
-.wrap{max-width:520px;margin:0 auto;padding:32px 16px}
-.card{background:#fff;border-radius:12px;padding:24px 28px;box-shadow:0 4px 16px rgba(40,60,90,.15);margin-bottom:20px}
-.card h2{margin:0 0 4px;font-size:20px;display:flex;align-items:center;justify-content:space-between}
-.sub{color:#8a9199;font-size:13px;margin:0 0 16px;line-height:1.6}
-#dot{width:10px;height:10px;border-radius:50%;background:#c3c9d1;flex:none}
-label{display:block;font-size:13px;color:#5a6470;margin-bottom:6px}
+:root{
+    /* 配色集中在这里（原本散在各条规则里，改主题得满文件找）。状态色按"点/字/底"
+       分三层：--ok 这类用于状态点与主按钮的实心块，--ok-fg 是配浅底用的深色文字，
+       --ok-bg 是浅色底 */
+    --bg:#eef1f5;         /* 页面背景 */
+    --surface:#fff;       /* 卡片、输入框的底 */
+    --on-accent:#fff;     /* 主按钮上的文字 */
+    --sunken:#f6f8fa;     /* 消息条、提示块的浅底 */
+    --track:#e3e8ef;      /* 页签/分段控件的轨道 */
+    --code-bg:#eceff3;    /* 命令示例的底 */
+    --divider:#eef0f3;    /* 分隔线、灰色徽章的底 */
+    --fg:#2b2f36;         /* 主文字 */
+    --fg-mid:#5a6470;     /* 次级文字：标签、状态条 */
+    --fg-muted:#8a9199;   /* 弱化文字：说明、表头 */
+    --fg-faint:#9aa3ad;   /* 最弱：空状态、页脚 */
+    --border:#d5dae1;     /* 输入框边框、状态条分隔点 */
+    --accent:#5b7cfa;     /* 链接、次级按钮 */
+    --off:#c3c9d1;        /* 未知/离线状态的灰点 */
+    --ok:#2f9e63;
+    --ok-fg:#1e7d4e;
+    --ok-bg:#eaf7f0;      /* 成功消息条的底 */
+    --ok-bg-soft:#e6f6ee; /* 成功徽章的底：与上一条几乎同色，保留原值不动既有观感 */
+    --err:#d64545;
+    --err-fg:#a5281f;
+    --err-bg:#fdecea;
+    --warn:#b26a00;
+    --warn-fg:#8a5000;
+    --warn-bg:#fdf1e3;
+}
+body{font-family:'Microsoft YaHei','Segoe UI',sans-serif;background:var(--bg);margin:0;color:var(--fg)}
+a{color:var(--accent)}
+.wrap{max-width:520px;margin:0 auto;padding:24px 16px}
+.card{background:var(--surface);border-radius:12px;padding:22px 24px;box-shadow:0 4px 16px rgba(40,60,90,.15);margin-bottom:20px}
+.card h2{margin:0 0 4px;font-size:19px;display:flex;align-items:center;justify-content:space-between}
+.sub{color:var(--fg-muted);font-size:13px;margin:0 0 16px;line-height:1.6}
+#dot{width:10px;height:10px;border-radius:50%;background:var(--off);flex:none}
+/* 状态点的三种颜色（renderStatus 按连接状态切 class）：未连接但热点在跑 =
+   用户正在配网，用橙色跟故障的红区分开 */
+#dot.on{background:var(--ok)}
+#dot.warn{background:var(--warn)}
+#dot.err{background:var(--err)}
+label{display:flex;justify-content:space-between;align-items:baseline;font-size:13px;color:var(--fg-mid);margin-bottom:6px}
+/* label 右侧的"当前值"小字：要改的东西和它现在的状态放同一行，不必上下对照两块 */
+.lblnote{color:var(--fg-muted);font-size:12px}
 .mt{margin-top:14px}
-input{box-sizing:border-box;width:100%;padding:10px 12px;font-size:14px;border:1px solid #d5dae1;border-radius:8px;outline:none}
-button{width:100%;margin-top:20px;padding:11px;font-size:15px;color:#fff;background:#2f9e63;border:0;border-radius:8px;cursor:pointer}
-button.mini{width:auto;margin:0;padding:4px 12px;font-size:12px;border-radius:6px;background:#5b7cfa}
-/* WiFi 卡默认折叠（连上后一般不关心，展开才显示表单）：
-   摘要行左侧标题、右侧连接状态点，隐藏浏览器默认三角换成文字箭头 */
-details.card{padding:16px 20px}
-details.card>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px}
-details.card>summary::-webkit-details-marker{display:none}
-details.card>summary::after{content:'修改 ▾';color:#9aa3ad;font-size:12px;flex:none}
-details.card[open]>summary::after{content:'收起 ▴'}
-.sumtitle{font-size:20px;font-weight:600}
-.sumstatus{font-size:13px;color:#5a6470;display:flex;align-items:center;gap:6px;
-    overflow:hidden;white-space:nowrap;text-overflow:ellipsis;min-width:0;flex:1}
-.wifi-body{margin-top:16px}
-/* 当前 WiFi 信息独立成块、逐行展示：SSID 最长 32 字符，折叠摘要一行塞不下 */
-.curinfo{background:#f6f8fa;border-radius:8px;padding:10px 14px;margin-bottom:16px}
-.curinfo .row{display:flex;gap:10px;padding:2px 0;font-size:14px;line-height:1.5}
-.curinfo .label{flex:none;width:5em;color:#5a6470;font-size:13px}
-.curinfo .value{min-width:0;word-break:break-all}
+input,select{box-sizing:border-box;width:100%;padding:10px 12px;font-size:14px;border:1px solid var(--border);border-radius:8px;outline:none;background:var(--surface);color:var(--fg)}
+button{width:100%;margin-top:20px;padding:11px;font-size:15px;color:var(--on-accent);background:var(--ok);border:0;border-radius:8px;cursor:pointer}
+button.mini{width:auto;margin:0;padding:4px 12px;font-size:12px;border-radius:6px;background:var(--accent)}
+/* 设备号/IP/SSID 这类逐字符读的内容用等宽，0 和 O、1 和 l 不容易看混 */
+.mono{font-family:Consolas,Menlo,monospace}
+
+/* 顶部状态条：连接状态、SSID、IP、热点一句话看全，不必进各页面找 */
+.statusbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px;
+    background:var(--surface);border-radius:12px;padding:13px 18px;margin-bottom:12px;
+    box-shadow:0 4px 16px rgba(40,60,90,.15);font-size:13px;color:var(--fg-mid)}
+.statusbar .sep{color:var(--border)}
+.statusbar .ellipsis{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;max-width:11em}
+.statusbar .spacer{flex:1}
+/* 拉不到状态时整条变淡：显示的还是上一次的值，别让它看着像实时数据 */
+.statusbar.offline{opacity:.55}
+
+/* 分段控件（页签 / 工作模式二选一）：一次只显示或只选中一块 */
+.tabs{display:flex;gap:4px;background:var(--track);border-radius:10px;padding:4px;margin-bottom:16px}
+.segmented{display:flex;gap:4px;background:var(--track);border-radius:10px;padding:4px}
+.tabs button,.segmented button{flex:1;width:auto;margin:0;padding:9px 0;font-size:14px;color:var(--fg-mid);
+    background:transparent;border:0;border-radius:7px;cursor:pointer}
+.tabs button.active,.segmented button.active{background:var(--surface);color:var(--fg);font-weight:600;box-shadow:0 1px 3px rgba(40,60,90,.14)}
+.segmented button{font-size:13px}
+.segmented button:disabled{opacity:.55;cursor:default}
+.panel[hidden]{display:none}
+
 /* 消息条：成功/失败两种配色，左侧色条 + 底色让结果一眼可辨；
    pre-line 让文案里的 \n 生效，first-line 把首行加粗当标题用 */
 .msg{display:none;margin:14px 0 0;padding:10px 12px;border-radius:8px;
-    border-left:3px solid #c3c9d1;background:#f6f8fa;color:#5a6470;
+    border-left:3px solid var(--off);background:var(--sunken);color:var(--fg-mid);
     font-size:13px;line-height:1.7;white-space:pre-line}
 .msg::first-line{font-weight:600}
-.msg.ok{background:#eaf7f0;border-left-color:#2f9e63;color:#1e7d4e}
-.msg.err{background:#fdecea;border-left-color:#d64545;color:#a5281f}
-/* 串口救急提示：配错 WiFi 断网后靠配置口 UART 重配，接线信息来自 /api/status */
-.hint{margin-top:16px;padding:12px 14px;border-radius:8px;background:#f6f8fa;font-size:13px;color:#5a6470;line-height:1.9}
-.hint-title{color:#2b2f36;font-weight:600}
-.hint-cmd{margin:8px 0;padding:6px 10px;border-radius:6px;background:#eceff3;
-    font-family:Consolas,Menlo,monospace;font-size:12.5px;color:#2b2f36}
-.hint-note{color:#8a9199;font-size:12px;line-height:1.7}
+.msg.ok{background:var(--ok-bg);border-left-color:var(--ok);color:var(--ok-fg)}
+.msg.err{background:var(--err-bg);border-left-color:var(--err);color:var(--err-fg)}
+/* 串口救急提示：平时不用看，折叠起来；接线信息来自 /api/status */
+.hint-details{margin-top:16px}
+.hint-details>summary{cursor:pointer;color:var(--accent);font-size:13px;list-style:none}
+.hint-details>summary::-webkit-details-marker{display:none}
+.hint-details>summary::after{content:' ▾'}
+.hint-details[open]>summary::after{content:' ▴'}
+.hint{margin-top:10px;padding:12px 14px;border-radius:8px;background:var(--sunken);font-size:13px;color:var(--fg-mid);line-height:1.9}
+.hint-title{color:var(--fg);font-weight:600}
+.hint-cmd{margin:8px 0;padding:6px 10px;border-radius:6px;background:var(--code-bg);
+    font-family:Consolas,Menlo,monospace;font-size:12.5px;color:var(--fg)}
+.hint-note{color:var(--fg-muted);font-size:12px;line-height:1.7}
 .hint-row{margin-top:6px}
-.hint-row b{font-family:Consolas,Menlo,monospace;color:#2b2f36}
+.hint-row b{font-family:Consolas,Menlo,monospace;color:var(--fg)}
+/* 配网模式横幅：用户此时连着设备自己的热点，页面第一眼要告诉他下一步做什么 */
+.banner{background:var(--warn-bg);border-left:3px solid var(--warn);color:var(--warn-fg);border-radius:8px;
+    padding:12px 14px;margin-bottom:12px;font-size:13px;line-height:1.8}
+.banner b{font-family:Consolas,Menlo,monospace}
 .devbox{min-height:60px;font-size:14px}
-.none{color:#9aa3ad;text-align:center;padding:20px 0}
+.none{color:var(--fg-faint);text-align:center;padding:20px 0}
 table{width:100%;border-collapse:collapse}
-th,td{text-align:left;padding:9px 8px;border-bottom:1px solid #eef0f3;font-size:14px}
-th{color:#8a9199;font-size:13px;font-weight:normal}
-td.mono{font-family:Consolas,Menlo,monospace}
+th,td{text-align:left;padding:9px 8px;border-bottom:1px solid var(--divider);font-size:14px}
+th{color:var(--fg-muted);font-size:13px;font-weight:normal}
+/* 末列（占用状态）靠右：表格通栏时两端的对齐撑住，不至于挤在左边一小撮 */
+th:last-child,td:last-child{text-align:right}
 .badge{display:inline-block;padding:3px 10px;border-radius:10px;font-size:12px}
-.badge.idle{background:#e6f6ee;color:#1e7d4e}
-.badge.busy{background:#fdf1e3;color:#b26a00}
-.foot{text-align:center;color:#9aa3ad;font-size:12px;margin-top:4px}
-.foot a{color:#5b7cfa}
+.badge.idle{background:var(--ok-bg-soft);color:var(--ok-fg)}
+.badge.busy{background:var(--warn-bg);color:var(--warn)}
+.badge.off{background:var(--divider);color:var(--fg-muted)}
+.foot{text-align:center;color:var(--fg-faint);font-size:12px;margin-top:4px}
+
+/* 桌面宽屏：屏幕够宽就不必全挤在中间一条——页签只在窄屏起"免得上下来回翻"
+   的作用。设备表通栏（本来就是表格，横着铺开合适），两张配置卡并排在下面
+   一行，这样各块高度差得不多，不会一边长一边短 */
+@media (min-width:880px){
+    .wrap{max-width:880px}
+    .tabs{display:none}
+    .panels{display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start}
+    .panel{margin-bottom:0}
+    .panel[hidden]{display:block}
+    #tab-devices{grid-column:1/-1}
+    .foot{margin-top:20px}
+}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <div class="card">
-    <h2>USB 设备<button class="mini" onclick="refreshAll()">刷新</button></h2>
-    <p class="sub">插在 ESP32 USB Host 口上的设备，可通过 USB/IP 网络共享给电脑</p>
-    <div id="devbox" class="devbox"></div>
+  <!-- 配网模式提示：用户连的就是设备自己的热点（见 renderProvisioningAp：
+      进入配网模式时连带自动切到 WiFi 页，让他直接能填）。
+      不写"连不上 WiFi"——AP 工作模式下热点是配置出来的，不是连不上 -->
+  <div id="apbanner" class="banner" style="display:none">
+    设备已开启配网热点 <b id="banner_ssid"></b>。在下面填好 WiFi 名称和密码并保存，连上后此热点会自动关闭。
   </div>
 
-  <!-- 设备信息是主关注点放最上；WiFi 连上后无需管理，默认收起 -->
-  <details id="wifipanel" class="card">
-    <summary>
-      <span class="sumtitle">WiFi</span>
-      <!-- 折叠摘要只留最短状态，详情在展开区逐行展示 -->
-      <span class="sumstatus"><span id="dot"></span><span id="st_val">状态读取中…</span></span>
-    </summary>
-    <div class="wifi-body">
-      <div class="curinfo">
-        <div class="row"><span class="label">SSID</span><span class="value" id="ssid_val"></span></div>
-        <div class="row"><span class="label">IP 地址</span><span class="value" id="ip_val"></span></div>
+  <!-- 状态条：所有状态一眼看全 -->
+  <div class="statusbar" id="statusbar">
+    <span id="dot"></span>
+    <span id="st_val">状态读取中…</span>
+    <span class="sep">·</span>
+    <span id="ssid_val" class="ellipsis">—</span>
+    <span class="sep">·</span>
+    <span id="ip_val" class="mono">—</span>
+    <span class="spacer"></span>
+    <span id="ap_sum" class="badge idle" style="display:none">配网热点运行中</span>
+  </div>
+
+  <nav class="tabs">
+    <button type="button" class="active" data-tab="devices" onclick="selectTab('devices')">USB 设备</button>
+    <button type="button" data-tab="wifi" onclick="selectTab('wifi')">WiFi</button>
+    <button type="button" data-tab="ap" onclick="selectTab('ap')">配网热点</button>
+  </nav>
+
+  <!-- 宽屏下这一层切成两列（见样式表末尾的媒体查询）：屏幕够宽就整块排开，
+       不靠页签分屏 -->
+  <div class="panels">
+
+  <section id="tab-devices" class="panel card">
+    <h2>USB 设备<button class="mini" type="button" onclick="refreshAll()">刷新</button></h2>
+    <p class="sub">插在 ESP32 USB Host 口上的设备，可通过 USB/IP 网络共享给电脑</p>
+    <div id="devbox" class="devbox"></div>
+    <!-- 拿到设备列表后下一步就是去电脑上 attach，但命令不在这个页面上时
+         用户得翻 README——那是最容易卡住的一步，直接放这里 -->
+    <details class="hint-details">
+      <summary>在电脑上怎么用这些设备？</summary>
+      <div class="hint">
+        <div class="hint-title">Linux 客户端</div>
+        <div class="hint-cmd">sudo modprobe vhci-hcd</div>
+        <div class="hint-cmd">sudo usbip attach -r &lt;设备IP&gt; -b &lt;busid&gt;</div>
+        <div class="hint-note">busid 就是上表里的 1-1 这种。Windows 用 usbip-win2 图形客户端，
+          服务器填设备 IP、端口 3240。完整步骤见
+          <a href="https://github.com/yunsmall/usbipdcpp_esp32" target="_blank" rel="noopener">项目主页</a></div>
       </div>
-      <p class="sub">连上才保存，失败保持原配置（最长等 15 秒）</p>
-      <label for="ssid">WiFi 名称（SSID）</label>
-      <input id="ssid" placeholder="例如 my_wifi" spellcheck="false">
-      <label for="password" class="mt">密码（开放网络留空）</label>
-      <input id="password" type="password" placeholder="不填 = 开放网络">
-      <button id="savebtn" onclick="saveWifi()">保存并重连</button>
-      <p id="msg" class="msg"></p>
-      <!-- 救急路径：本页只能联网访问，配错 WiFi 断网时按此接线走串口重配。
-           启用/未启用两种状态整块切换（见 refreshWifi） -->
+    </details>
+  </section>
+
+  <section id="tab-wifi" class="panel card" hidden>
+    <h2>WiFi 设置</h2>
+    <p class="sub">连上才保存，失败保持原配置（最长等 15 秒）</p>
+    <!-- 工作模式是"设备怎么用 WiFi"，与下面的凭据是两回事：点击立即生效，
+         不需要配合表单保存（见 setWorkMode） -->
+    <label>工作模式（点击立即生效）</label>
+    <div class="segmented">
+      <button type="button" id="mode_sta" onclick="setWorkMode('sta')">连接 WiFi（STA）</button>
+      <button type="button" id="mode_ap" onclick="setWorkMode('ap')">只做热点（AP）</button>
+    </div>
+    <p class="sub" id="mode_hint" style="margin:8px 0 0"></p>
+    <!-- 模式切换的结果紧跟在控件下面：写进页面底部那个消息条的话，视线要往下跳 -->
+    <p id="modemsg" class="msg"></p>
+    <label for="ssid" class="mt">WiFi 名称（SSID）</label>
+    <input id="ssid" placeholder="例如 my_wifi" spellcheck="false">
+    <label for="password" class="mt">密码（开放网络留空）</label>
+    <input id="password" type="password" placeholder="不填 = 开放网络">
+    <button id="savebtn" onclick="saveWifi()">保存并重连</button>
+    <p id="msg" class="msg"></p>
+    <!-- 救急路径：本页只能联网访问，配错 WiFi 断网时按此接线走串口重配。
+         启用/未启用两种状态整块切换（见 renderStatus） -->
+    <details class="hint-details">
+      <summary>连不上本页时：走串口救急</summary>
       <div class="hint" id="hint_serial">
         <div class="hint-title">配错 WiFi 连不上本页时，走串口救急</div>
         <div>用 USB 转 TTL 串口线（115200，GND 共地）接配置口，终端里执行：</div>
@@ -106,42 +217,138 @@ td.mono{font-family:Consolas,Menlo,monospace}
         <div>配置口 UART 没编译进本固件（Kconfig 的 USBIPD_CFG_CONSOLE_ENABLE 关闭），
           需重新编译开启，或先换一个能连上的 WiFi 再回来配置</div>
       </div>
-    </div>
-  </details>
-  <p class="foot">设备列表每 5 秒自动刷新 ·
+    </details>
+  </section>
+
+  <section id="tab-ap" class="panel card" hidden>
+    <h2>配网热点<span class="badge off" id="ap_state_val">—</span></h2>
+    <p class="sub">连不上 WiFi（或工作模式设为 AP，见 WiFi 页）时自动开启，
+      连上它访问 <b class="mono">192.168.4.1</b> 即可配网</p>
+    <!-- 当前值和修改入口放同一处：名称框直接预填现状（见 renderProvisioningAp），
+         密码固件不下发，只能靠 label 右侧的小字说明现状 -->
+    <label for="ap_ssid">热点名称（SSID）</label>
+    <input id="ap_ssid" placeholder="例如 usbipd-setup" spellcheck="false" oninput="ap_ssid_dirty = true">
+    <label for="ap_pass" class="mt">密码（留空 = 开放热点）<span class="lblnote" id="ap_auth_note">—</span></label>
+    <input id="ap_pass" type="password" placeholder="不填 = 开放热点">
+    <button id="apbtn" onclick="saveAp()">保存热点配置</button>
+    <p id="apmsg" class="msg"></p>
+  </section>
+
+  </div>
+
+  <p class="foot">状态与设备列表每 5 秒自动刷新 ·
     <a href="https://github.com/yunsmall/usbipdcpp_esp32" target="_blank" rel="noopener">项目主页（README / 使用说明）</a></p>
 </div>
 
 <script>
+// 一次只显示一个面板：窄屏上三块内容堆成一列要一直翻，分页后每块一屏。
+// 宽屏（≥880px）下样式表强制三块全显示、这里的 hidden 不生效；页签高亮和
+// hidden 都在本函数里设置、永远同源，所以窗口宽度来回变化也不会出现
+// "高亮的面板和显示的内容对不上"
+function selectTab(name) {
+    for (const btn of document.querySelectorAll('.tabs button')) {
+        btn.classList.toggle('active', btn.dataset.tab === name);
+    }
+    for (const panel of document.querySelectorAll('.panel')) {
+        panel.hidden = panel.id !== 'tab-' + name;
+    }
+}
+
 // kind：'ok' 成功（绿）/ 'err' 失败（红）/ 省略 = 中性（灰：进行中或信息提示）
-function setMsg(text, kind) {
-    const m = document.getElementById('msg');
+function setMsgOn(id, text, kind) {
+    const m = document.getElementById(id);
     // 配色与左侧色条走 .ok / .err（见样式表），这里只切类名
     m.className = 'msg' + (kind ? ' ' + kind : '');
     m.style.display = 'block';
     m.textContent = text;
 }
+function setMsg(text, kind) { setMsgOn('msg', text, kind); }
+function setApMsg(text, kind) { setMsgOn('apmsg', text, kind); }
+function setModeMsg(text, kind) { setMsgOn('modemsg', text, kind); }
+
+// 配网模式的边沿标记：只在"进入配网模式"那一次自动切到 WiFi 页，
+// 用户切走之后轮询不再抢（见 renderProvisioningAp）
+let ap_was_active = false;
+
+// 热点名称框被用户改过：改过就不再用轮询值覆盖，免得输入到一半被冲掉
+let ap_ssid_dirty = false;
+
+// 配网热点相关的界面全部在这里更新：横幅、状态条徽章、热点页。单独成函数是
+// 因为它同时管好几处 DOM，散在轮询主流程里改一处容易看漏另一处
+function renderProvisioningAp(j) {
+    const ap_active = !!j.ap_active;
+    // 横幅说明当前处境；进入配网模式的那一次自动切到 WiFi 页（用户连上热点
+    // 打开本页就是为了填 WiFi，让他直接能填）
+    document.getElementById('apbanner').style.display = ap_active ? '' : 'none';
+    if (ap_active) {
+        document.getElementById('banner_ssid').textContent = j.ap_ssid || '';
+        if (!ap_was_active) selectTab('wifi');
+    }
+    ap_was_active = ap_active;
+
+    // 状态条上的徽章只在热点真运行时出现，平时不占视线
+    const ap_sum = document.getElementById('ap_sum');
+    ap_sum.style.display = ap_active ? '' : 'none';
+    ap_sum.textContent = j.work_mode === 'ap' ? '配网热点运行中（AP 模式）' : '配网热点运行中';
+
+    // 名称框预填当前值，用户不用照着别处抄
+    if (!ap_ssid_dirty) document.getElementById('ap_ssid').value = j.ap_ssid || '';
+    // 密码固件不下发（只回有没有），只能在 label 右侧说明现状——改名字时
+    // 很容易把密码框留空，那就把热点改成开放的了，先让用户看见
+    document.getElementById('ap_auth_note').textContent =
+        j.ap_auth ? '已设置（WPA2）' : '无密码';
+    // 状态徽章挂在标题右侧：运行中 = 绿，未运行 = 灰
+    const st = document.getElementById('ap_state_val');
+    st.className = 'badge ' + (ap_active ? 'idle' : 'off');
+    st.textContent = ap_active ? '运行中' : '未运行';
+}
+
+// 工作模式的分段控件是"点了就切"（见 setWorkMode），没有未提交状态，
+// 所以每次轮询都跟着固件同步
+function renderWorkMode(j) {
+    const is_ap = j.work_mode === 'ap';
+    document.getElementById('mode_sta').classList.toggle('active', !is_ap);
+    document.getElementById('mode_ap').classList.toggle('active', is_ap);
+    document.getElementById('mode_hint').textContent = is_ap
+        ? '当前只做配网热点，不尝试连 WiFi'
+        : '当前连接 WiFi：连不上时自动开配网热点，并在后台继续重试';
+}
+
+function renderStatus(j) {
+    // 未连接但热点在跑 = 用户正在配网，是正常状态；用橙色跟故障的红区分开
+    // （三种颜色定义在 CSS 的 #dot.on/.warn/.err 里）
+    document.getElementById('dot').className =
+        j.connected ? 'on' : (j.ap_active ? 'warn' : 'err');
+    document.getElementById('st_val').textContent = j.connected ? '已连接'
+        : (j.ap_active ? '未连接（配网中）' : '未连接');
+    document.getElementById('ssid_val').textContent = j.ssid || '（未配置）';
+    // 状态条一行放不下长 SSID（会省略号截断），悬停看全名
+    document.getElementById('ssid_val').title = j.ssid || '';
+    document.getElementById('ip_val').textContent = j.ip || '—';
+    renderProvisioningAp(j);
+    renderWorkMode(j);
+    // 配置口 GPIO（-1 = 该功能编译期未启用）：两种状态整块切换，
+    // 未启用时展示说明块而非残缺的接线行
+    const console_ok = j.console_tx >= 0 && j.console_rx >= 0;
+    document.getElementById('hint_serial').style.display = console_ok ? '' : 'none';
+    document.getElementById('hint_noserial').style.display = console_ok ? 'none' : '';
+    if (console_ok) {
+        document.getElementById('cfg_tx').textContent = j.console_tx;
+        document.getElementById('cfg_rx').textContent = j.console_rx;
+    }
+}
 
 async function refreshWifi() {
+    const bar = document.getElementById('statusbar');
     try {
-        const j = await (await fetch('/api/status')).json();
-        document.getElementById('dot').style.background = j.connected ? '#2f9e63' : '#d64545';
-        document.getElementById('st_val').textContent = j.connected ? '已连接' : '未连接';
-        document.getElementById('ssid_val').textContent = j.ssid || '（未配置）';
-        document.getElementById('ip_val').textContent = j.ip || '—';
-        // 配置口 GPIO（-1 = 该功能编译期未启用）：两种状态整块切换，
-        // 未启用时展示说明块而非残缺的接线行
-        const console_ok = j.console_tx >= 0 && j.console_rx >= 0;
-        document.getElementById('hint_serial').style.display = console_ok ? '' : 'none';
-        document.getElementById('hint_noserial').style.display = console_ok ? 'none' : '';
-        if (console_ok) {
-            document.getElementById('cfg_tx').textContent = j.console_tx;
-            document.getElementById('cfg_rx').textContent = j.console_rx;
-        }
+        renderStatus(await (await fetch('/api/status')).json());
+        bar.classList.remove('offline');
     } catch (e) {
-        // 状态点一并复位：连不上设备时不能还留着上一次的绿点
-        document.getElementById('dot').style.background = '#c3c9d1';
+        // 状态点一并复位：连不上设备时不能还留着上一次的绿点（回到基础样式的灰点）
+        document.getElementById('dot').className = '';
         document.getElementById('st_val').textContent = '无法连接设备';
+        // 整条变淡：拉不到状态时 SSID/IP 只会停在上一次的值，别让它们看着像实时的
+        bar.classList.add('offline');
     }
 }
 
@@ -199,6 +406,12 @@ async function saveWifi() {
         setMsg('请填写 WiFi 名称', 'err');
         return;
     }
+    const pass = document.getElementById('password').value;
+    // 按 UTF-8 字节算（同 saveAp）：固件与 WPA2 校验的都是字节长度；空 = 开放网络
+    if (pass && new TextEncoder().encode(pass).length < 8) {
+        setMsg('密码至少 8 位\n开放网络请留空', 'err');
+        return;
+    }
     // 固件要等实连结果（最长 15 秒）才应答，期间禁用按钮防重复提交
     const btn = document.getElementById('savebtn');
     btn.disabled = true;
@@ -207,8 +420,7 @@ async function saveWifi() {
     const opts = {
         method: 'POST',
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-        body: 'ssid=' + encodeURIComponent(ssid) +
-              '&password=' + encodeURIComponent(document.getElementById('password').value)
+        body: 'ssid=' + encodeURIComponent(ssid) + '&password=' + encodeURIComponent(pass)
     };
     // 本端超时略大于固件的等待上限；老浏览器没有 AbortSignal.timeout 就不设，
     // 一直等固件应答
@@ -232,6 +444,83 @@ async function saveWifi() {
         setMsg('连接成功，配置已保存' + (j.ip ? '\nIP: ' + j.ip : ''), 'ok');
     } else {
         setMsg('连接失败：' + ((j && j.error) || '未知错误') + '\n配置未保存，继续使用原配置', 'err');
+    }
+    refreshWifi();
+}
+
+async function saveAp() {
+    const ssid = document.getElementById('ap_ssid').value.trim();
+    if (!ssid) {
+        setApMsg('请填写热点名称', 'err');
+        return;
+    }
+    const pass = document.getElementById('ap_pass').value;
+    // 按 UTF-8 字节数算：固件和 WPA2 校验的都是字节长度，按字符数算会把
+    // 中文密码误拦（4 个汉字就是 12 字节）
+    if (pass && new TextEncoder().encode(pass).length < 8) {
+        // 固件端也会拒（WPA2 下限 8 位），先拦一道省一次往返
+        setApMsg('热点密码至少要 8 位\n想要开放热点就把密码留空', 'err');
+        return;
+    }
+    const btn = document.getElementById('apbtn');
+    btn.disabled = true;
+    const opts = {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'ssid=' + encodeURIComponent(ssid) + '&password=' + encodeURIComponent(pass)
+    };
+    // 超时给到 20 秒：固件的配置操作是串行的，本请求可能排在"保存并重连"
+    // （最长等 15 秒连接结果）后面才执行
+    if (typeof AbortSignal.timeout === 'function') {
+        opts.signal = AbortSignal.timeout(20000);
+    }
+    let j;
+    try {
+        j = await (await fetch('/api/ap', opts)).json();
+    } catch (e) {
+        setApMsg('保存失败：设备无响应', 'err');
+        btn.disabled = false;
+        return;
+    }
+    btn.disabled = false;
+    if (j && j.ok) {
+        // 固件已接受这个值，重新交给轮询同步（见 renderProvisioningAp）
+        ap_ssid_dirty = false;
+        setApMsg('已保存：' + ssid + '\n名称/密码改动下次开热点时生效（正在运行的热点不受影响）', 'ok');
+    } else {
+        setApMsg('保存失败：' + ((j && j.error) || '未知错误'), 'err');
+    }
+    refreshWifi();
+}
+
+// 工作模式点击即切换：切 AP 会断开 WiFi、切 STA 会立刻开始重连，两者都可能
+// 让本机换网络，所以失败分支也提示按新网络重开页面
+async function setWorkMode(mode) {
+    const btn = document.getElementById('mode_' + mode);
+    btn.disabled = true;
+    const opts = {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'mode=' + encodeURIComponent(mode)
+    };
+    // 同 saveAp：可能排在"保存并重连"后面才轮到（固件端配置操作串行）
+    if (typeof AbortSignal.timeout === 'function') {
+        opts.signal = AbortSignal.timeout(20000);
+    }
+    let j;
+    try {
+        j = await (await fetch('/api/mode', opts)).json();
+    } catch (e) {
+        setModeMsg('设备无响应\n若刚切换模式，本机可能已断网——按新网络重开本页查看结果', 'err');
+        btn.disabled = false;
+        return;
+    }
+    btn.disabled = false;
+    if (j && j.ok) {
+        setModeMsg(mode === 'ap' ? '已切到 AP 模式：不再尝试连 WiFi，配网热点随即开启'
+                                 : '已切到 STA 模式：开始连接 WiFi', 'ok');
+    } else {
+        setModeMsg('切换失败：' + ((j && j.error) || '未知错误'), 'err');
     }
     refreshWifi();
 }

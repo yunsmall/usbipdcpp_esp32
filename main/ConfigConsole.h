@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdarg>
 
 #include <esp_err.h>
@@ -58,12 +59,18 @@ public:
 private:
     ConfigConsole() = default;
 
+    /**
+     * @brief init 的实际实现：只被幂等包装执行一次（见 init 的注释）
+     */
+    static esp_err_t init_repl_and_mirror();
+
     // esp_log 的自定义 vprintf：UART0 原样输出 + 镜像开启时写到配置口
     static int mirror_log_vprintf(const char *fmt, va_list args);
 
     // 由 esp_log_set_vprintf 返回的原 vprintf（保持 UART0 输出）
     static vprintf_like_t s_orig_log_vprintf;
 
-    // 挂接的 usbip 服务器（devices 命令的数据源，见 set_server 注释）
-    usbipdcpp::Esp32Server *esp32_server_ = nullptr;
+    // 挂接的 usbip 服务器（devices 命令的数据源，见 set_server 注释）。
+    // 启动线程写、REPL 任务读，用原子指针免得构成 data race
+    std::atomic<usbipdcpp::Esp32Server *> esp32_server_{nullptr};
 };
