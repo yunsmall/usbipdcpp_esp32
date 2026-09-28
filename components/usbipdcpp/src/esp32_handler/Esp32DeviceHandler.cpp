@@ -727,9 +727,23 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
                 SPDLOG_INFO("transfer seqnum {} canceled on endpoint {}", cb->seqnum, trx->bEndpointAddress);
                 break;
             }
-            case USB_TRANSFER_STATUS_STALL:
-                SPDLOG_ERROR("endpoint {} is stalled", trx->bEndpointAddress);
+            case USB_TRANSFER_STATUS_STALL: {
+                // 控制传输的 STALL = 某个请求被设备拒了。"端点 xx 被 stall" 这句本身
+                // 没有信息量，把 setup packet 解出来才知道是哪个请求——排查复合设备
+                // （YubiKey 这种多接口的）时这是唯一能定位的线索
+                if ((trx->bEndpointAddress & 0x7F) == 0 && trx->data_buffer != nullptr) {
+                    const auto *setup = reinterpret_cast<const usb_setup_packet_t *>(trx->data_buffer);
+                    SPDLOG_ERROR("endpoint {:02x} is stalled: bmRequestType={:02x}, bRequest={:02x}, "
+                                 "wValue={:04x}, wIndex={:04x}, wLength={}",
+                                 trx->bEndpointAddress, setup->bmRequestType, setup->bRequest,
+                                 setup->wValue, setup->wIndex, setup->wLength);
+                }
+                else {
+                    // 非控制端点（批量/中断）的 STALL 是端点级的，只有地址可说
+                    SPDLOG_ERROR("endpoint {:02x} is stalled", trx->bEndpointAddress);
+                }
                 break;
+            }
             case USB_TRANSFER_STATUS_NO_DEVICE:
                 handler->device_removed_ = true;
                 SPDLOG_INFO("device removed?");
