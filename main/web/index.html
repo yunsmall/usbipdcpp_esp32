@@ -61,6 +61,16 @@ input,select{box-sizing:border-box;width:100%;padding:10px 12px;font-size:14px;b
 /* 禁用态（勾"无密码"后的密码框）：上面自定义的 background 盖掉了浏览器默认的
    灰底，显式压暗，让"这个框现在不用填"看得出来 */
 input:disabled{opacity:.55}
+/* 按钮的禁用态同理（保存进行中）：自定义的绿色背景同样盖掉了浏览器默认灰化 */
+button:disabled{opacity:.55;cursor:default}
+/* 密码框 + 显示切换按钮：一行 flex，按钮取内容宽、输入框吃掉剩余 */
+.passrow{display:flex;gap:8px}
+.passrow input{flex:1;min-width:0}
+/* 眼睛按钮：仿状态条的语言按钮，小描边；图标是内联 SVG，线条色走 currentColor 跟主题 */
+.reveal{width:auto;margin:0;padding:2px 8px;display:flex;align-items:center;justify-content:center;
+    color:var(--fg-muted);background:transparent;border:1px solid var(--border);border-radius:8px;flex:none}
+.reveal:hover{color:var(--accent);border-color:var(--accent)}
+.reveal svg{display:block}
 button{width:100%;margin-top:20px;padding:11px;font-size:15px;color:var(--on-accent);background:var(--ok);border:0;border-radius:8px;cursor:pointer}
 button.mini{width:auto;margin:0;padding:4px 12px;font-size:12px;border-radius:6px;background:var(--accent)}
 /* 语言切换：状态条右端的描边小按钮，不跟主操作抢视线 */
@@ -217,7 +227,12 @@ th:last-child,td:last-child{text-align:right}
       <label for="ssid" class="mt" data-i18n="ssid_label"></label>
       <input id="ssid" data-i18n-ph="ssid_ph" spellcheck="false" oninput="ssid_dirty = true">
       <label for="password" class="mt"><span data-i18n="pass_label"></span><span class="lblnote" id="wifi_auth_note">—</span></label>
-      <input id="password" type="password" data-i18n-ph="pass_ph">
+      <div class="passrow">
+        <input id="password" type="password" data-i18n-ph="pass_ph">
+        <!-- 眼睛按钮：图标与悬停提示随输入框当前类型走，内容由 JS 填（见
+             refreshRevealButtons），不挂 data-i18n -->
+        <button type="button" id="password_reveal" class="reveal" onclick="togglePass('password')"></button>
+      </div>
       <!-- "留空"猜不出是"不改密码"还是"要改成开放"：把后者做成显式勾选（见 saveNet）。
      有意不按当前配置预勾选：复选框只表达目标，保持开放也得是显式动作（与"空密码不再有
      静默含义"同一原则）；当前配置有没有密码由密码栏旁的小字单独显示（wifi_auth） -->
@@ -238,7 +253,10 @@ th:last-child,td:last-child{text-align:right}
         <label for="ap_ssid" class="mt" data-i18n="ap_ssid_label"></label>
         <input id="ap_ssid" data-i18n-ph="ap_ssid_ph" spellcheck="false" oninput="ap_ssid_dirty = true">
         <label for="ap_pass" class="mt"><span data-i18n="ap_pass_label"></span><span class="lblnote" id="ap_auth_note">—</span></label>
-        <input id="ap_pass" type="password" data-i18n-ph="ap_pass_ph">
+        <div class="passrow">
+          <input id="ap_pass" type="password" data-i18n-ph="ap_pass_ph">
+          <button type="button" id="ap_pass_reveal" class="reveal" onclick="togglePass('ap_pass')"></button>
+        </div>
         <button id="apbtn" data-i18n="ap_save" onclick="saveAp()"></button>
         <p id="apmsg" class="msg"></p>
       </div>
@@ -331,6 +349,8 @@ const I18N = {
         ssid_ph: '例如 my_wifi',
         pass_label: '密码',
         pass_ph: '至少 8 位',
+        show_pass: '显示密码',
+        hide_pass: '隐藏密码',
         open_net_label: '无密码（开放网络）',
         net_save: '保存并连接',
         net_save_noconn: '保存',
@@ -435,6 +455,8 @@ const I18N = {
         ssid_ph: 'e.g. my_wifi',
         pass_label: 'Password',
         pass_ph: 'at least 8 characters',
+        show_pass: 'Show password',
+        hide_pass: 'Hide password',
         open_net_label: 'No password (open network)',
         net_save: 'Save and connect',
         net_save_noconn: 'Save',
@@ -518,6 +540,8 @@ function applyI18n() {
     document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
     for (const el of document.querySelectorAll('[data-i18n]')) el.textContent = t(el.dataset.i18n);
     for (const el of document.querySelectorAll('[data-i18n-ph]')) el.placeholder = t(el.dataset.i18nPh);
+    // 眼睛按钮的图标与提示随输入框状态，不能走 data-i18n，这里按当前状态补刷
+    refreshRevealButtons();
 }
 
 function toggleLang() {
@@ -618,8 +642,41 @@ function pickConnect(yes) {
 // 勾了"无密码"就禁用密码框：两个控件说的是同一个目标（目标密码取什么），
 // 同时可编辑只会互相打架
 function toggleOpenNet() {
-    document.getElementById('password').disabled =
-        document.getElementById('open_net').checked;
+    const dis = document.getElementById('open_net').checked;
+    document.getElementById('password').disabled = dis;
+    // 显示/隐藏按钮一起禁用：框都不让填了，还能切明文只会让人以为有东西可看
+    document.getElementById('password_reveal').disabled = dis;
+}
+
+// 明文/掩码切换：密码看不见时打错字是这类页面最常见的翻车点
+function togglePass(input_id) {
+    const el = document.getElementById(input_id);
+    el.type = el.type === 'password' ? 'text' : 'password';
+    refreshRevealButtons();
+}
+
+// 眼睛按钮的图标与悬停提示跟着各自输入框的当前类型走；切语言后也要按状态重刷，
+// 所以按钮不挂 data-i18n（静态内容会和"已切到明文"的状态打架），由 applyI18n
+// 末尾统一调用本函数。
+// 图标（内联 SVG：无外部依赖、线条色走 currentColor 跟主题；睁眼=当前是掩码、
+// 点它看明文，斜杠眼=当前明文、点它藏回去）定义在函数体内：applyI18n 在本脚本
+// 顶层立刻调到这里，而顶层后段的 const 那时还在暂时性死区，放外面页面加载就会
+// 抛错、脚本直接从那里中断
+function refreshRevealButtons() {
+    const EYE_SVG =
+        '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" ' +
+        'stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>' +
+        '<circle cx="12" cy="12" r="3"/></svg>';
+    const EYE_OFF_SVG =
+        '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" ' +
+        'stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>' +
+        '<circle cx="12" cy="12" r="3"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+    for (const id of ['password', 'ap_pass']) {
+        const hidden = document.getElementById(id).type === 'password';
+        const btn = document.getElementById(id + '_reveal');
+        btn.innerHTML = hidden ? EYE_SVG : EYE_OFF_SVG;
+        btn.title = t(hidden ? 'show_pass' : 'hide_pass');
+    }
 }
 
 // 选择控件和它牵动的显隐：凭据框只在"连接"时出现，选"不连接"换成一句说明
