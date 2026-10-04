@@ -37,9 +37,11 @@ void WifiConnection::event_handler(void *arg, esp_event_base_t event_base,
         WifiConfigManager::instance().reconnect();
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGI(TAG, "连接 AP 失败");
-        // 记下原因供 apply_config 判定（密码错/找不到 AP 时提前结束等待）
+        // 主动切换（switch_sta_config / set_work_mode 断开旧连接）也走本事件，
+        // 一律报"连接 AP 失败"会误导：措辞中性、reason 一并打出便于区分
         auto *event = static_cast<wifi_event_sta_disconnected_t *>(event_data);
+        ESP_LOGI(TAG, "与 AP 断开（reason=%d）", event != nullptr ? event->reason : -1);
+        // 记下原因供 apply_config 判定（密码错/找不到 AP 时提前结束等待）
         if (event != nullptr) {
             WifiConfigManager::instance().note_disconnect_reason(event->reason);
         }
@@ -133,6 +135,9 @@ esp_err_t WifiConnection::start()
     wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
     wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
 
+    // esp_pthread_set_cfg 存进"当前线程"的 TLS，pthread_create 也只读调用线程的
+    // TLS——这段设置只影响下面创建的线程，其它任务即便在此间隙被调度并创建线程，
+    // 读到的也是各自 TLS 里的配置，不受影响
     esp_pthread_cfg_t pthread_cfg = esp_pthread_get_default_config();
     pthread_cfg.prio = 10;
     pthread_cfg.pin_to_core = 1; // 设置核心1
@@ -153,11 +158,14 @@ esp_err_t WifiConnection::start()
             // 指数退避重连：AP 不在场/密码错误等会连续失败，每次都立刻重试只会
             // 高频触发扫描刷日志耗电，失败越久间隔越长：1s → 2s → … → 64s 封顶。
             // 间隔翻倍在本次 connect 之前完成、清零在 STA_CONNECTED（必然晚于
-            // connect 成功）之后发生，两条路径在时序上不会互相误判
-            const std::uint32_t exp = backoff_exp_.load();
-            if (exp < MAX_BACKOFF_EXP) {
-                backoff_exp_.store(exp + 1);
-            }
+            // connect 成功）之后发生，判定上不会互相误判——若"刚断就连上"的
+            // 抖动让清零与某次 CAS 几乎同时，写回的自增值可能多留一级，下次
+            // 断线的首间隔从 1s 变 2s，下次连上即复位，不值得为此加同步
+            // 读-改-写用 CAS：与 STA_CONNECTED 回调的清零并发时，load + store
+            // 会把对方刚写入的值整个覆盖掉（清零丢失）
+            std::uint32_t exp = backoff_exp_.load();
+            while (exp < MAX_BACKOFF_EXP &&
+                   !backoff_exp_.compare_exchange_weak(exp, exp + 1)) { }
             std::this_thread::sleep_for(std::chrono::seconds(1u << exp));
             if (should_stop_.load())
                 break;
@@ -245,8 +253,9 @@ void WifiConnection::enable_provisioning_ap()
     const std::string ap_password = manager.ap_password();
     if (ap_ssid.empty()) {
         // 看门狗每秒来一次，而"Kconfig 与 NVS 都没配名称"是永远失败的配置错误：
-        // 只在第一次报错，否则日志被每秒一条刷屏
-        if (!ap_error_logged_.exchange(true)) {
+        // 同一来源只在第一次报错，否则日志被每秒一条刷屏；名称修好后来源变化，
+        // 后续的失败（如 set_mode）会重新报
+        if (ap_last_error_source_.exchange(ApErrorSource::SsidEmpty) != ApErrorSource::SsidEmpty) {
             ESP_LOGE(TAG, "配网热点 SSID 为空（Kconfig 与 NVS 都没配），无法启动热点");
         }
         return;
@@ -257,8 +266,8 @@ void WifiConnection::enable_provisioning_ap()
     if (ap_netif_ == nullptr) {
         ap_netif_ = esp_netif_create_default_wifi_ap();
         if (ap_netif_ == nullptr) {
-            // 看门狗每秒重试：和下面 set_mode/set_config 失败一样只报第一次
-            if (!ap_error_logged_.exchange(true)) {
+            // 看门狗每秒重试：和下面 set_mode/set_config 失败一样，同一来源只报第一次
+            if (ap_last_error_source_.exchange(ApErrorSource::Netif) != ApErrorSource::Netif) {
                 ESP_LOGE(TAG, "创建 AP netif 失败（同类失败不再重复报）");
             }
             return;
@@ -299,23 +308,23 @@ void WifiConnection::enable_provisioning_ap()
     // APSTA：STA 在后台继续重试（旧 AP 恢复的话能自己连回来），连上即关热点
     esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
     if (err != ESP_OK) {
-        // 看门狗每秒重试：持续失败时同一行 ERROR 会刷屏，只报第一次
-        if (!ap_error_logged_.exchange(true)) {
+        // 看门狗每秒重试：同一来源持续失败只报第一次
+        if (ap_last_error_source_.exchange(ApErrorSource::SetMode) != ApErrorSource::SetMode) {
             ESP_LOGE(TAG, "切换到 APSTA 模式失败（同类失败不再重复报）: %s", esp_err_to_name(err));
         }
         return;
     }
     err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
     if (err != ESP_OK) {
-        if (!ap_error_logged_.exchange(true)) {
+        if (ap_last_error_source_.exchange(ApErrorSource::SetConfig) != ApErrorSource::SetConfig) {
             ESP_LOGE(TAG, "设置热点配置失败（同类失败不再重复报）: %s", esp_err_to_name(err));
         }
         esp_wifi_set_mode(WIFI_MODE_STA); // 回退，别把设备留在半吊子状态
         return;
     }
 
-    // 开成功了：复位"只报一次"的标记，下次再失败时还能重新看到错误
-    ap_error_logged_.store(false);
+    // 开成功了：复位标记，下次再失败时还能重新看到错误
+    ap_last_error_source_.store(ApErrorSource::None);
     ap_active_.store(true);
     manager.note_ap_started();
     if (ap_config.ap.authmode == WIFI_AUTH_OPEN) {
@@ -339,9 +348,14 @@ bool WifiConnection::disable_provisioning_ap()
     // 回到纯 STA：热点关闭（AP netif 保留，下次进入配网模式直接复用）
     const esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "关闭配网热点失败（保留请求，下一轮重试）: %s", esp_err_to_name(err));
+        // 看门狗每秒重试：持续失败时同一行 ERROR 会刷屏，只报第一次
+        if (!ap_stop_error_logged_.exchange(true)) {
+            ESP_LOGE(TAG, "关闭配网热点失败（保留请求，下一轮重试）: %s", esp_err_to_name(err));
+        }
         return false;
     }
+    // 真关掉了：复位"只报一次"的标记，下次再失败时还能重新看到
+    ap_stop_error_logged_.store(false);
     ap_active_.store(false);
     ESP_LOGI(TAG, "STA 已连上，配网热点已关闭");
     return true;

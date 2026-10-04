@@ -18,8 +18,8 @@ namespace usbipdcpp
  *
  * 路由：
  *   GET  /            网页（main/web/index.html，EMBED_FILES 嵌入，见 CMakeLists）
- *   GET  /api/status  {"connected":..,"ssid":"..,"ip":"..","console_tx":..,"console_rx":..,
- *                      "ap_active":..,"ap_ssid":"..","ap_auth":..,"work_mode":"sta|ap"}
+ *   GET  /api/status  {"connected":..,"ssid":"..,"ip":"..","wifi_auth":..,"console_tx":..,
+ *                      "console_rx":..,"ap_active":..,"ap_ssid":"..","ap_auth":..,"work_mode":"sta|ap"}
  *   GET  /api/devices {"devices":[{"busid":"1-1","vid":"046d","pid":"c077","in_use":..},..]}
  *                     设备列表与占用状态（由 esp32_usbipdcpp.cpp 挂接的 Esp32Server 提供）
  *   POST /api/wifi    form-urlencoded: ssid=..&password=..（空 password=开放 AP），

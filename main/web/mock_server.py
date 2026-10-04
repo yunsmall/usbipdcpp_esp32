@@ -38,6 +38,7 @@ state = {
     "ap_active": False,
     "ap_ssid": "usbipd-setup",
     "ap_auth": True,
+    "wifi_auth": True,
     "work_mode": "sta",
 }
 devices = {
@@ -62,6 +63,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(state)
         elif self.path.startswith("/api/devices"):
             self._send_json(devices)
+        elif self.path.startswith("/api/"):
+            # 未知 API 回 JSON 404 而不是同一个 index.html：回 HTML 的话前端
+            # .json() 会抛解析错误，看起来像页面坏了，而不是"这个接口不存在"
+            self._send_json({"code": "not_found"}, 404)
         else:
             # 其余路径一律回 index.html（含浏览器可能请求的 /favicon.ico）
             html = (BASE_DIR / "index.html").read_bytes()
@@ -106,8 +111,11 @@ class Handler(BaseHTTPRequestHandler):
         time.sleep(1.5)
         state["connected"] = True
         state["ssid"] = ssid
+        state["wifi_auth"] = bool(password)
         state["ip"] = "192.168.1.100"
-        self._send_json({"ok": True, "ip": state["ip"]})
+        # SSID 以 nvs 开头模拟"NVS 写失败"（连得上但保存不了，配合页面的提示分支验证）
+        persisted = not ssid.lower().startswith("nvs")
+        self._send_json({"ok": True, "ip": state["ip"], "persisted": persisted})
         print(f"[mock] 保存 WiFi: ssid={ssid!r} password={'***' if password else '(空=开放网络)'}"
               f" → 连接成功")
 

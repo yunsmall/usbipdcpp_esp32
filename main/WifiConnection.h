@@ -93,10 +93,15 @@ private:
     // esp_wifi_set_mode 是与驱动交互的重量级调用，在 esp_event 任务里直接调
     // 会阻塞其它 WiFi 事件的处理
     std::atomic_bool ap_stop_requested_{false};
-    // 开热点失败的错误日志只报一次（热点名为空、set_mode/set_config 失败都算）：
-    // 看门狗每秒重试，持续失败会让同一行 ERROR 每秒刷屏；开成功后复位，
-    // 下次再失败时还能重新看到
-    std::atomic_bool ap_error_logged_{false};
+    // 开热点失败的来源分类（ap_last_error_source_ 的取值）
+    enum class ApErrorSource { None, SsidEmpty, Netif, SetMode, SetConfig };
+    // 开热点失败的错误日志按"来源"只报一次：看门狗每秒重试，同一来源持续失败
+    // 只留第一行 ERROR；来源变了（用户改好配置、或失败换了环节）说明是新问题，
+    // 再报一次；开成功后复位为 None。不能用一个布尔记"报过没有"：先来的失败
+    // 会占住标记，把后面真正的新错误（比如 SSID 修好后 set_mode 又失败）一起吞掉
+    std::atomic<ApErrorSource> ap_last_error_source_{ApErrorSource::None};
+    // 关热点失败的错误日志同理只报一次（看门狗每秒重试）；某次真关掉后复位
+    std::atomic_bool ap_stop_error_logged_{false};
     // 配网看门狗线程：每秒查一次"是否该拉热点了"（见 WifiConfigManager::
     // should_start_provisioning_ap），ESP32 单射频，热点只在真连不上时才开
     std::thread provisioning_watchdog_thread_;

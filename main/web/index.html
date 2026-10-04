@@ -53,7 +53,14 @@ label{display:flex;justify-content:space-between;align-items:baseline;font-size:
 /* label 右侧的"当前值"小字：要改的东西和它现在的状态放同一行，不必上下对照两块 */
 .lblnote{color:var(--fg-muted);font-size:12px}
 .mt{margin-top:14px}
+/* "无密码"勾选行：勾上后密码框禁用（两个控件说同一件事，见 toggleOpenNet）；
+   复选框要压回全局 input 的 width:100%，否则会被拉成一整行 */
+.checkline{display:flex;justify-content:flex-start;gap:8px;align-items:center;margin:10px 0 0;font-size:13px;color:var(--fg-mid);cursor:pointer}
+.checkline input{width:auto;padding:0;margin:0;flex:none}
 input,select{box-sizing:border-box;width:100%;padding:10px 12px;font-size:14px;border:1px solid var(--border);border-radius:8px;outline:none;background:var(--surface);color:var(--fg)}
+/* 禁用态（勾"无密码"后的密码框）：上面自定义的 background 盖掉了浏览器默认的
+   灰底，显式压暗，让"这个框现在不用填"看得出来 */
+input:disabled{opacity:.55}
 button{width:100%;margin-top:20px;padding:11px;font-size:15px;color:var(--on-accent);background:var(--ok);border:0;border-radius:8px;cursor:pointer}
 button.mini{width:auto;margin:0;padding:4px 12px;font-size:12px;border-radius:6px;background:var(--accent)}
 /* 语言切换：状态条右端的描边小按钮，不跟主操作抢视线 */
@@ -68,7 +75,14 @@ button.mini{width:auto;margin:0;padding:4px 12px;font-size:12px;border-radius:6p
     background:var(--surface);border-radius:12px;padding:13px 18px;margin-bottom:12px;
     box-shadow:0 4px 16px rgba(40,60,90,.15);font-size:13px;color:var(--fg-mid)}
 .statusbar .sep{color:var(--border)}
-.statusbar .ellipsis{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;max-width:11em}
+/* 当前工作模式：这个信息本来只在 WiFi 页里能看到，状态条给一个始终在场的标记。
+   AP 用警示色——它意味着设备这会儿不连 WiFi，跟"配网中"是同一处境 */
+.statusbar .tag{padding:2px 8px;border-radius:8px;background:var(--track);color:var(--fg-mid);font-size:12px}
+.statusbar .tag.ap{background:var(--warn-bg);color:var(--warn)}
+/* SSID 和 IP 各占一行：flex-basis:100% 让它们各自独占整行（其后的元素被挤到
+   下一行），min-width:0 允许压到比自身内容窄，超长时省略号才会生效 */
+.statusbar #ssid_val,.statusbar #ip_val{flex-basis:100%;min-width:0}
+.statusbar .ellipsis{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 .statusbar .spacer{flex:1}
 /* 拉不到状态时整条变淡：显示的还是上一次的值，别让它看着像实时数据 */
 .statusbar.offline{opacity:.55}
@@ -121,16 +135,12 @@ th:last-child,td:last-child{text-align:right}
 .badge.off{background:var(--divider);color:var(--fg-muted)}
 .foot{text-align:center;color:var(--fg-faint);font-size:12px;margin-top:4px}
 
-/* 桌面宽屏：屏幕够宽就不必全挤在中间一条——页签只在窄屏起"免得上下来回翻"
-   的作用。设备表通栏（本来就是表格，横着铺开合适），两张配置卡并排在下面
-   一行，这样各块高度差得不多，不会一边长一边短 */
+/* 桌面宽屏：屏幕够宽就不必靠页签分屏，设备表和网络设置从上往下排开即可
+   （面板间距由 .card 自己的 margin-bottom 给，不需要额外的栅格间距） */
 @media (min-width:880px){
     .wrap{max-width:880px}
     .tabs{display:none}
-    .panels{display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start}
-    .panel{margin-bottom:0}
     .panel[hidden]{display:block}
-    #tab-devices{grid-column:1/-1}
     .foot{margin-top:20px}
 }
 </style>
@@ -146,23 +156,22 @@ th:last-child,td:last-child{text-align:right}
     <span data-i18n="banner_pre"></span><b id="banner_ssid"></b><span data-i18n="banner_post"></span>
   </div>
 
-  <!-- 状态条：所有状态一眼看全 -->
+  <!-- 状态条：所有状态一眼看全。SSID 和 IP 各占一行——两者长度都不固定，
+       挤在同一行时 SSID 会被两侧元素夹着，再长的名字也得截断 -->
   <div class="statusbar" id="statusbar">
     <span id="dot"></span>
     <span id="st_val"></span>
-    <span class="sep">·</span>
-    <span id="ssid_val" class="ellipsis">—</span>
-    <span class="sep">·</span>
-    <span id="ip_val" class="mono">—</span>
+    <span id="mode_tag" class="tag">—</span>
     <span class="spacer"></span>
     <span id="ap_sum" class="badge idle" style="display:none"></span>
     <button type="button" id="langbtn" class="langbtn" data-i18n="lang_btn" onclick="toggleLang()"></button>
+    <span id="ssid_val" class="ellipsis">—</span>
+    <span id="ip_val" class="mono">—</span>
   </div>
 
   <nav class="tabs">
     <button type="button" class="active" data-tab="devices" data-i18n="tab_devices" onclick="selectTab('devices')"></button>
-    <button type="button" data-tab="wifi" data-i18n="tab_wifi" onclick="selectTab('wifi')"></button>
-    <button type="button" data-tab="ap" data-i18n="tab_ap" onclick="selectTab('ap')"></button>
+    <button type="button" data-tab="net" data-i18n="tab_net" onclick="selectTab('net')"></button>
   </nav>
 
   <!-- 宽屏下这一层切成两列（见样式表末尾的媒体查询）：屏幕够宽就整块排开，
@@ -188,25 +197,53 @@ th:last-child,td:last-child{text-align:right}
     </details>
   </section>
 
-  <section id="tab-wifi" class="panel card" hidden>
-    <h2 data-i18n="wifi_title"></h2>
-    <p class="sub" data-i18n="wifi_sub"></p>
-    <!-- 工作模式是"设备怎么用 WiFi"，与下面的凭据是两回事：点击立即生效，
-         不需要配合表单保存（见 setWorkMode） -->
-    <label data-i18n="work_mode"></label>
+  <section id="tab-net" class="panel card" hidden>
+    <h2 data-i18n="net_title"></h2>
+    <p class="sub" data-i18n="net_sub"></p>
+
+    <!-- 连不连 WiFi 跟名称/密码是同一件事的两半，一起在点保存时才生效：
+         拆成"点了就切的模式按钮 + 另一个保存按钮"时，同一个面板里两套生效
+         时机，用户得先分清哪个会当场断网（见 saveNet） -->
+    <label data-i18n="connect_label"></label>
     <div class="segmented">
-      <button type="button" id="mode_sta" data-i18n="mode_sta" onclick="setWorkMode('sta')"></button>
-      <button type="button" id="mode_ap" data-i18n="mode_ap" onclick="setWorkMode('ap')"></button>
+      <button type="button" id="conn_yes" data-i18n="conn_yes" onclick="pickConnect(true)"></button>
+      <button type="button" id="conn_no" data-i18n="conn_no" onclick="pickConnect(false)"></button>
     </div>
-    <p class="sub" id="mode_hint" style="margin:8px 0 0"></p>
-    <!-- 模式切换的结果紧跟在控件下面：写进页面底部那个消息条的话，视线要往下跳 -->
-    <p id="modemsg" class="msg"></p>
-    <label for="ssid" class="mt" data-i18n="ssid_label"></label>
-    <input id="ssid" data-i18n-ph="ssid_ph" spellcheck="false">
-    <label for="password" class="mt" data-i18n="pass_label"></label>
-    <input id="password" type="password" data-i18n-ph="pass_ph">
-    <button id="savebtn" data-i18n="save_reconnect" onclick="saveWifi()"></button>
+    <p class="sub" id="conn_hint" style="margin:8px 0 0"></p>
+
+    <!-- 要连的那个 WiFi 的凭据：选"不连接"时整块换成说明（见 renderNetPage）——
+         设备都不连 WiFi 了，还摆着名称/密码两个框只会让人以为要填两遍 -->
+    <div id="wifi_cred">
+      <label for="ssid" class="mt" data-i18n="ssid_label"></label>
+      <input id="ssid" data-i18n-ph="ssid_ph" spellcheck="false" oninput="ssid_dirty = true">
+      <label for="password" class="mt"><span data-i18n="pass_label"></span><span class="lblnote" id="wifi_auth_note">—</span></label>
+      <input id="password" type="password" data-i18n-ph="pass_ph">
+      <!-- "留空"猜不出是"不改密码"还是"要改成开放"：把后者做成显式勾选（见 saveNet）。
+     有意不按当前配置预勾选：复选框只表达目标，保持开放也得是显式动作（与"空密码不再有
+     静默含义"同一原则）；当前配置有没有密码由密码栏旁的小字单独显示（wifi_auth） -->
+      <label class="checkline"><input type="checkbox" id="open_net" onchange="toggleOpenNet()"><span data-i18n="open_net_label"></span></label>
+    </div>
+    <p class="sub" id="ap_mode_note" style="display:none" data-i18n="ap_mode_note"></p>
+    <button id="savebtn" data-i18n="net_save" onclick="saveNet()"></button>
     <p id="msg" class="msg"></p>
+
+    <!-- 配网热点：设备连不上 WiFi 时自动开启的兜底通道，平时不用管，所以收进
+         折叠区；但名称/密码得能改——用户正是要连上它才能进来配网。
+         修改入口和当前值放同一处：名称框预填现状（见 renderProvisioningAp），
+         密码固件不下发，只能靠 label 右侧的小字说明现状 -->
+    <details class="hint-details">
+      <summary data-i18n="ap_summary"></summary>
+      <div class="hint">
+        <div data-i18n="ap_hint"></div>
+        <label for="ap_ssid" class="mt" data-i18n="ap_ssid_label"></label>
+        <input id="ap_ssid" data-i18n-ph="ap_ssid_ph" spellcheck="false" oninput="ap_ssid_dirty = true">
+        <label for="ap_pass" class="mt"><span data-i18n="ap_pass_label"></span><span class="lblnote" id="ap_auth_note">—</span></label>
+        <input id="ap_pass" type="password" data-i18n-ph="ap_pass_ph">
+        <button id="apbtn" data-i18n="ap_save" onclick="saveAp()"></button>
+        <p id="apmsg" class="msg"></p>
+      </div>
+    </details>
+
     <!-- 救急路径：本页只能联网访问，配错 WiFi 断网时按此接线走串口重配。
          启用/未启用两种状态整块切换（见 renderStatus） -->
     <details class="hint-details">
@@ -224,19 +261,6 @@ th:last-child,td:last-child{text-align:right}
         <div data-i18n="serial_unavailable"></div>
       </div>
     </details>
-  </section>
-
-  <section id="tab-ap" class="panel card" hidden>
-    <h2><span data-i18n="ap_title"></span><span class="badge off" id="ap_state_val">—</span></h2>
-    <p class="sub"><span data-i18n="ap_sub_pre"></span> <b class="mono">192.168.4.1</b> <span data-i18n="ap_sub_post"></span></p>
-    <!-- 当前值和修改入口放同一处：名称框直接预填现状（见 renderProvisioningAp），
-         密码固件不下发，只能靠 label 右侧的小字说明现状 -->
-    <label for="ap_ssid" data-i18n="ap_ssid_label"></label>
-    <input id="ap_ssid" data-i18n-ph="ap_ssid_ph" spellcheck="false" oninput="ap_ssid_dirty = true">
-    <label for="ap_pass" class="mt"><span data-i18n="ap_pass_label"></span><span class="lblnote" id="ap_auth_note">—</span></label>
-    <input id="ap_pass" type="password" data-i18n-ph="ap_pass_ph">
-    <button id="apbtn" data-i18n="ap_save" onclick="saveAp()"></button>
-    <p id="apmsg" class="msg"></p>
   </section>
 
   </div>
@@ -263,14 +287,12 @@ const I18N = {
         not_connected: '未连接',
         no_device_status: '无法连接设备',
         ssid_unset: '（未配置）',
-        ap_running_ap_mode: '配网热点运行中（AP 模式）',
         ap_running: '配网热点运行中',
         banner_pre: '设备已开启配网热点 ',
         banner_post: '。在下面填好 WiFi 名称和密码并保存，连上后此热点会自动关闭。',
         // 页签
         tab_devices: 'USB 设备',
-        tab_wifi: 'WiFi',
-        tab_ap: '配网热点',
+        tab_net: '网络',
         // 设备页
         devices_title: 'USB 设备',
         refresh: '刷新',
@@ -287,19 +309,34 @@ const I18N = {
         dtable_status: '状态',
         in_use: '使用中',
         free: '空闲',
-        // WiFi 页
-        wifi_title: 'WiFi 设置',
-        wifi_sub: '连上才保存，失败保持原配置（最长等 15 秒）',
-        work_mode: '工作模式（点击立即生效）',
-        mode_sta: '连接 WiFi（STA）',
-        mode_ap: '只做热点（AP）',
-        mode_hint_sta: '当前连接 WiFi：连不上时自动开配网热点，并在后台继续重试',
-        mode_hint_ap: '当前只做配网热点，不尝试连 WiFi',
-        ssid_label: 'WiFi 名称（SSID）',
+        // 网络页
+        net_title: '网络',
+        net_sub: '设备连上 WiFi 后就能在局域网上用它；连不上时自动开一个配网热点兜底',
+        connect_label: '设备要连的 WiFi',
+        conn_yes: '连接 WiFi',
+        conn_no: '不连接，只开热点',
+        conn_hint_yes: '连不上时设备会自动开一个配网热点，让你连回来改设置（见下方）',
+        conn_hint_no: '设备不连接任何 WiFi，只开自己的配网热点',
+        // 状态条上的模式标记：短到一眼扫过，完整措辞在网络页的选择说明里
+        tag_sta: 'STA 模式',
+        tag_ap: 'AP 模式',
+        // 选"不连接"时，凭据区整块换成这句话（见 renderConnectChoice）
+        ap_mode_note: '这里无需填写。热点自己的名称和密码在下方「配网热点设置」里改。',
+        // 确认框：这两个动作都会断开本页自己所在的 WiFi，问的时候必须把后果
+        // 说清楚——只问"确定吗"等于没问，用户不知道自己在确认什么
+        confirm_save: '将断开当前 WiFi 去连「{0}」，本页会失联。继续？',
+        confirm_disconnect: '设备会断开当前 WiFi、只留配网热点，本页将失联（需重连设备热点）。继续？',
+        confirm_reconnect: '设备将切回连接模式、自动连已保存的 WiFi，本页可能失联。继续？',
+        ssid_label: '要连接的 WiFi 名称（SSID）',
         ssid_ph: '例如 my_wifi',
-        pass_label: '密码（开放网络留空）',
-        pass_ph: '不填 = 开放网络',
-        save_reconnect: '保存并重连',
+        pass_label: '密码',
+        pass_ph: '至少 8 位',
+        open_net_label: '无密码（开放网络）',
+        net_save: '保存并连接',
+        net_save_noconn: '保存',
+        // 只切模式时的结果（见 saveNet）：模式切换已生效 ≠ WiFi 已连上
+        mode_saved_sta: '已切回连接模式，设备会自动连接已保存的 WiFi',
+        mode_saved_ap: '已切换为只开热点，设备不再连接 WiFi',
         serial_summary: '连不上本页时：走串口救急',
         serial_title: '配错 WiFi 连不上本页时，走串口救急',
         serial_intro: '用 USB 转 TTL 串口线（115200，GND 共地）接配置口，终端里执行：',
@@ -308,13 +345,10 @@ const I18N = {
         serial_rx: 'TTL 的 TX → 本机 RX 脚：',
         serial_unavailable_title: '串口救急不可用',
         serial_unavailable: '配置口 UART 没编译进本固件（Kconfig 的 USBIPD_CFG_CONSOLE_ENABLE 关闭），需重新编译开启，或先换一个能连上的 WiFi 再回来配置',
-        // 配网热点页
-        ap_title: '配网热点',
-        ap_sub_pre: '连不上 WiFi（或工作模式设为 AP，见 WiFi 页）时自动开启，连上它访问',
-        ap_sub_post: '即可配网',
-        ap_state_running: '运行中',
-        ap_state_idle: '未运行',
-        ap_ssid_label: '热点名称（SSID）',
+        // 配网热点（网络页里的折叠区）
+        ap_summary: '配网热点设置',
+        ap_hint: '设备连不上 WiFi 时自动开启的热点，连上它访问 192.168.4.1 就能回来改设置。',
+        ap_ssid_label: '配网热点名称（SSID）',
         ap_ssid_ph: '例如 usbipd-setup',
         ap_pass_label: '密码（留空 = 开放热点）',
         ap_pass_ph: '不填 = 开放热点',
@@ -326,20 +360,20 @@ const I18N = {
         foot_link: '项目主页（README / 使用说明）',
         // 操作结果：这些是客户端拼的提示（{0} = 固件回的 code 译文或错误码）
         err_ssid_required: '请填写 WiFi 名称',
-        err_password_too_short: '密码至少 8 位\n开放网络请留空',
+        err_password_too_short: '密码至少 8 位\n无密码的开放网络请勾选下方选项',
+        err_pass_or_open: '请填写密码，或勾选下方「无密码（开放网络）」',
         connecting: '正在连接，最长等 15 秒…',
         switched_network: '设备可能已切到新网络\n请用新 IP 重新打开本页查看结果',
         save_ok: '连接成功，配置已保存',
+        save_ok_no_persist: '连接成功，但配置没能保存（设备存储异常，重启后会回退原配置）',
         save_failed: '连接失败：{0}\n配置未保存，继续使用原配置',
+        mode_switched_wifi_failed: '模式已切换，但 WiFi 未连上：{0}\n配置未保存，继续使用原配置',
         err_ap_ssid_required: '请填写热点名称',
         err_ap_pass_short: '热点密码至少要 8 位\n想要开放热点就把密码留空',
         ap_save_failed: '保存失败：{0}',
         ap_no_response: '保存失败：设备无响应',
         ap_saved: '已保存：{0}\n名称/密码改动下次开热点时生效（正在运行的热点不受影响）',
-        mode_no_response: '设备无响应\n若刚切换模式，本机可能已断网——按新网络重开本页查看结果',
-        mode_ap_ok: '已切到 AP 模式：不再尝试连 WiFi，配网热点随即开启',
-        mode_sta_ok: '已切到 STA 模式：开始连接 WiFi',
-        mode_fail: '切换失败：{0}',
+        net_no_change: '没有改动，无需保存',
         unknown_error: '未知错误',
         unknown_code: '未知错误（{0}）',
         // 固件错误码（HttpConfigApi.cpp 的 code 字段）
@@ -350,7 +384,6 @@ const I18N = {
         err_apply_failed: '配置没能应用',
         err_ap_invalid_arg: '热点名称 1~31 字符；密码留空（开放）或 8~63 位',
         err_save_failed: '保存失败',
-        err_mode_save_failed: '模式保存失败',
         err_bad_mode: '模式参数只认 sta 或 ap',
         err_bad_body: '请求内容为空或过长',
         err_status_too_large: '设备状态数据异常',
@@ -365,13 +398,11 @@ const I18N = {
         not_connected: 'Not connected',
         no_device_status: 'Cannot reach the board',
         ssid_unset: '(not configured)',
-        ap_running_ap_mode: 'Setup AP running (AP mode)',
         ap_running: 'Setup AP running',
         banner_pre: 'The board is running its setup hotspot ',
         banner_post: '. Enter the WiFi name and password below and save; the hotspot closes automatically once connected.',
         tab_devices: 'USB Devices',
-        tab_wifi: 'WiFi',
-        tab_ap: 'Setup AP',
+        tab_net: 'Network',
         devices_title: 'USB Devices',
         refresh: 'Refresh',
         devices_sub: 'Devices plugged into the ESP32 USB Host port, shared to your computer over USB/IP',
@@ -387,18 +418,28 @@ const I18N = {
         dtable_status: 'Status',
         in_use: 'in use',
         free: 'free',
-        wifi_title: 'WiFi Settings',
-        wifi_sub: 'Saved only once it connects; a failed attempt keeps the current settings (waits up to 15 s)',
-        work_mode: 'Work mode (applies immediately)',
-        mode_sta: 'Connect to WiFi (STA)',
-        mode_ap: 'Hotspot only (AP)',
-        mode_hint_sta: 'Connecting to WiFi: a setup hotspot starts automatically if it cannot connect, and retries continue in the background',
-        mode_hint_ap: 'Hotspot only: WiFi is not attempted',
-        ssid_label: 'WiFi name (SSID)',
+        net_title: 'Network',
+        net_sub: 'Once the device joins your WiFi you can use it on the LAN; if it cannot connect it starts a setup hotspot as a fallback',
+        connect_label: 'WiFi for the device to connect to',
+        conn_yes: 'Connect to WiFi',
+        conn_no: 'Do not connect, hotspot only',
+        conn_hint_yes: 'If it cannot connect, the device starts a setup hotspot automatically so you can get back in (see below)',
+        conn_hint_no: 'The device does not connect to any WiFi and only runs its own setup hotspot',
+        tag_sta: 'STA mode',
+        tag_ap: 'AP mode',
+        ap_mode_note: 'Nothing to fill in here. The name and password of the setup hotspot are set below.',
+        confirm_save: 'This drops the current WiFi and connects to "{0}"; this page loses connection. Continue?',
+        confirm_disconnect: 'The device drops the current WiFi and keeps only the setup hotspot; this page loses connection (reconnect to the device hotspot). Continue?',
+        confirm_reconnect: 'The device switches back to WiFi mode and reconnects to the saved network; this page may lose connection. Continue?',
+        ssid_label: 'WiFi name to connect to (SSID)',
         ssid_ph: 'e.g. my_wifi',
-        pass_label: 'Password (leave empty for an open network)',
-        pass_ph: 'empty = open network',
-        save_reconnect: 'Save and reconnect',
+        pass_label: 'Password',
+        pass_ph: 'at least 8 characters',
+        open_net_label: 'No password (open network)',
+        net_save: 'Save and connect',
+        net_save_noconn: 'Save',
+        mode_saved_sta: 'Switched back to WiFi mode; the device will auto-connect to the saved network',
+        mode_saved_ap: 'Switched to hotspot-only mode; the device no longer connects to WiFi',
         serial_summary: 'Cannot reach this page? Use the serial console',
         serial_title: 'Locked out by a wrong WiFi setting? Use the serial console',
         serial_intro: 'Wire a USB-TTL serial adapter to the console port (115200, common ground), then run:',
@@ -407,12 +448,9 @@ const I18N = {
         serial_rx: 'TTL TX → board RX pin:',
         serial_unavailable_title: 'Serial console unavailable',
         serial_unavailable: 'The console UART is not compiled into this firmware (Kconfig USBIPD_CFG_CONSOLE_ENABLE is off). Rebuild with it enabled, or switch to a WiFi network that works first.',
-        ap_title: 'Setup AP',
-        ap_sub_pre: 'Starts automatically when WiFi cannot be reached (or when the work mode is AP, see the WiFi tab). Connect to it and open',
-        ap_sub_post: 'to configure',
-        ap_state_running: 'running',
-        ap_state_idle: 'not running',
-        ap_ssid_label: 'Hotspot name (SSID)',
+        ap_summary: 'Setup AP settings',
+        ap_hint: 'Started automatically when the device cannot reach your WiFi. Connect to it at 192.168.4.1 to get back in and change settings.',
+        ap_ssid_label: 'Setup AP name (SSID)',
         ap_ssid_ph: 'e.g. usbipd-setup',
         ap_pass_label: 'Password (empty = open hotspot)',
         ap_pass_ph: 'empty = open hotspot',
@@ -422,20 +460,20 @@ const I18N = {
         foot_pre: 'Status and device list refresh every 5 s · ',
         foot_link: 'Project home (README / docs)',
         err_ssid_required: 'Please enter the WiFi name',
-        err_password_too_short: 'Password must be at least 8 characters\nLeave it empty for an open network',
+        err_password_too_short: 'Password must be at least 8 characters\nFor an open network, tick the option below',
+        err_pass_or_open: 'Enter a password, or tick "No password (open network)" below',
         connecting: 'Connecting, waiting up to 15 s…',
         switched_network: 'The board may have switched networks\nReopen this page at its new IP to see the result',
         save_ok: 'Connected, settings saved',
+        save_ok_no_persist: 'Connected, but the settings could not be saved (storage failure; the previous settings return after reboot)',
         save_failed: 'Connection failed: {0}\nNothing was saved; the previous settings are still in use',
+        mode_switched_wifi_failed: 'Mode switched, but the WiFi connection failed: {0}\nNothing was saved; the previous settings are still in use',
         err_ap_ssid_required: 'Please enter the hotspot name',
         err_ap_pass_short: 'Hotspot password must be at least 8 characters\nLeave it empty for an open hotspot',
         ap_save_failed: 'Save failed: {0}',
         ap_no_response: 'Save failed: no response from the board',
         ap_saved: 'Saved: {0}\nTakes effect the next time the hotspot starts (a running hotspot is unaffected)',
-        mode_no_response: 'No response from the board\nIf you just switched modes, this machine may have lost its network — reopen the page at the new address',
-        mode_ap_ok: 'Switched to AP mode: WiFi is no longer attempted and the setup hotspot starts now',
-        mode_sta_ok: 'Switched to STA mode: connecting to WiFi',
-        mode_fail: 'Switch failed: {0}',
+        net_no_change: 'Nothing changed, no need to save',
         unknown_error: 'unknown error',
         unknown_code: 'unknown error ({0})',
         err_too_long: 'SSID or password too long',
@@ -445,7 +483,6 @@ const I18N = {
         err_apply_failed: 'Could not apply the configuration',
         err_ap_invalid_arg: 'Hotspot name must be 1–31 characters; password empty (open) or 8–63 characters',
         err_save_failed: 'Could not save',
-        err_mode_save_failed: 'Could not save the work mode',
         err_bad_mode: 'Mode must be sta or ap',
         err_bad_body: 'Request body is empty or too large',
         err_status_too_large: 'Device status data is malformed',
@@ -488,8 +525,8 @@ function toggleLang() {
     localStorage.setItem('lang', lang);
     applyI18n();
     // 页面上已有的消息条是上一刻、上一语言的结论，直接清掉免得中英混排；
-    // 其余动态文字（状态条、设备表、热点页）交给紧接着的 refreshAll 重画
-    for (const id of ['msg', 'apmsg', 'modemsg']) {
+    // 其余动态文字（状态条、设备表、网络页）交给紧接着的 refreshAll 重画
+    for (const id of ['msg', 'apmsg']) {
         document.getElementById(id).style.display = 'none';
     }
     refreshAll();
@@ -522,14 +559,27 @@ function setMsgOn(id, text, kind) {
 }
 function setMsg(text, kind) { setMsgOn('msg', text, kind); }
 function setApMsg(text, kind) { setMsgOn('apmsg', text, kind); }
-function setModeMsg(text, kind) { setMsgOn('modemsg', text, kind); }
 
-// 配网模式的边沿标记：只在"进入配网模式"那一次自动切到 WiFi 页，
+// 配网模式的边沿标记：只在"进入配网模式"那一次自动切到网络页，
 // 用户切走之后轮询不再抢（见 renderProvisioningAp）
 let ap_was_active = false;
 
 // 热点名称框被用户改过：改过就不再用轮询值覆盖，免得输入到一半被冲掉
 let ap_ssid_dirty = false;
+
+// 要连的 WiFi 名称框同理：预填当前值，但用户改过就不再覆盖
+let ssid_dirty = false;
+
+// 配网热点的固定地址：页面别处（热点说明、状态条）都引这个值
+const AP_ADDR = '192.168.4.1';
+
+// 连接选择（连 / 不连 WiFi）与凭据同属一个表单，点保存才一起生效：
+// want_connect 是界面上选中的，cur_connect 是固件当前实际状态，
+// connect_dirty 标记用户动过——轮询就不再覆盖他的选择（见 renderNetPage / saveNet）
+let want_connect = true;
+let cur_connect = true;
+let connect_dirty = false;
+let cur_ssid = '';
 
 // 配网热点相关的界面全部在这里更新：横幅、状态条徽章、热点页。单独成函数是
 // 因为它同时管好几处 DOM，散在轮询主流程里改一处容易看漏另一处
@@ -540,14 +590,15 @@ function renderProvisioningAp(j) {
     document.getElementById('apbanner').style.display = ap_active ? '' : 'none';
     if (ap_active) {
         document.getElementById('banner_ssid').textContent = j.ap_ssid || '';
-        if (!ap_was_active) selectTab('wifi');
+        if (!ap_was_active) selectTab('net');
     }
     ap_was_active = ap_active;
 
     // 状态条上的徽章只在热点真运行时出现，平时不占视线
     const ap_sum = document.getElementById('ap_sum');
     ap_sum.style.display = ap_active ? '' : 'none';
-    ap_sum.textContent = t(j.work_mode === 'ap' ? 'ap_running_ap_mode' : 'ap_running');
+    // 徽章只管热点状态：是 AP 还是 STA 由状态条上的模式标记说，别在这儿重复一遍
+    ap_sum.textContent = t('ap_running');
 
     // 名称框预填当前值，用户不用照着别处抄
     if (!ap_ssid_dirty) document.getElementById('ap_ssid').value = j.ap_ssid || '';
@@ -555,19 +606,53 @@ function renderProvisioningAp(j) {
     // 很容易把密码框留空，那就把热点改成开放的了，先让用户看见
     document.getElementById('ap_auth_note').textContent =
         t(j.ap_auth ? 'ap_auth_set' : 'ap_auth_none');
-    // 状态徽章挂在标题右侧：运行中 = 绿，未运行 = 灰
-    const st = document.getElementById('ap_state_val');
-    st.className = 'badge ' + (ap_active ? 'idle' : 'off');
-    st.textContent = t(ap_active ? 'ap_state_running' : 'ap_state_idle');
 }
 
-// 工作模式的分段控件是"点了就切"（见 setWorkMode），没有未提交状态，
-// 所以每次轮询都跟着固件同步
-function renderWorkMode(j) {
+// 点"连 / 不连"只是改本地选择，跟改名称密码一样要点保存才生效（见 saveNet）
+function pickConnect(yes) {
+    want_connect = yes;
+    connect_dirty = true;
+    renderConnectChoice();
+}
+
+// 勾了"无密码"就禁用密码框：两个控件说的是同一个目标（目标密码取什么），
+// 同时可编辑只会互相打架
+function toggleOpenNet() {
+    document.getElementById('password').disabled =
+        document.getElementById('open_net').checked;
+}
+
+// 选择控件和它牵动的显隐：凭据框只在"连接"时出现，选"不连接"换成一句说明
+function renderConnectChoice() {
+    document.getElementById('conn_yes').classList.toggle('active', want_connect);
+    document.getElementById('conn_no').classList.toggle('active', !want_connect);
+    document.getElementById('conn_hint').textContent = t(want_connect ? 'conn_hint_yes' : 'conn_hint_no');
+    document.getElementById('wifi_cred').style.display = want_connect ? '' : 'none';
+    document.getElementById('ap_mode_note').style.display = want_connect ? 'none' : '';
+    // 按钮文案跟着选择走：选"不连接"时还写"保存并连接"就自相矛盾了。
+    // 按钮上留着 data-i18n 是为了首屏和切语言时有个正确的兜底文案
+    document.getElementById('savebtn').textContent = t(want_connect ? 'net_save' : 'net_save_noconn');
+}
+
+// 把固件状态同步进网络页：用户没动过的字段才跟随刷新——动过的等他提交，
+// 否则填到一半就被轮询冲掉
+function renderNetPage(j) {
     const is_ap = j.work_mode === 'ap';
-    document.getElementById('mode_sta').classList.toggle('active', !is_ap);
-    document.getElementById('mode_ap').classList.toggle('active', is_ap);
-    document.getElementById('mode_hint').textContent = t(is_ap ? 'mode_hint_ap' : 'mode_hint_sta');
+    cur_connect = !is_ap;
+    if (!connect_dirty) want_connect = cur_connect;
+    renderConnectChoice();
+
+    // 状态条上也标一个：这个信息别处看不到，得进网络页才知道
+    const tag = document.getElementById('mode_tag');
+    tag.textContent = t(is_ap ? 'tag_ap' : 'tag_sta');
+    tag.classList.toggle('ap', is_ap);
+
+    // 名称框预填当前值（同热点名称框）：改密码时不用把 SSID 重抄一遍
+    if (!ssid_dirty) document.getElementById('ssid').value = j.ssid || '';
+    cur_ssid = j.ssid || '';
+    // 密码栏旁的现状小字（同热点区做法）：固件只报"有没有密码"不下发密码本身
+    document.getElementById('wifi_auth_note').textContent =
+        t(j.wifi_auth ? 'ap_auth_set' : 'ap_auth_none');
 }
 
 function renderStatus(j) {
@@ -577,12 +662,20 @@ function renderStatus(j) {
         j.connected ? 'on' : (j.ap_active ? 'warn' : 'err');
     document.getElementById('st_val').textContent =
         t(j.connected ? 'connected' : (j.ap_active ? 'not_connected_ap' : 'not_connected'));
-    document.getElementById('ssid_val').textContent = j.ssid || t('ssid_unset');
-    // 状态条一行放不下长 SSID（会省略号截断），悬停看全名
-    document.getElementById('ssid_val').title = j.ssid || '';
-    document.getElementById('ip_val').textContent = j.ip || '—';
+    // SSID/IP 显示"此刻真正能用的入口"：连着 WiFi 就是连的哪条、IP 多少；
+    // 只开热点时，配置里存的那个 WiFi 名并没连上，摆着只会让人以为连着，
+    // 换成热点名和热点地址——那才是此刻能连上设备的东西
+    let shown_name = j.ssid, shown_ip = j.ip;
+    if (!j.connected && j.ap_active) {
+        shown_name = j.ap_ssid;
+        shown_ip = AP_ADDR;
+    }
+    document.getElementById('ssid_val').textContent = shown_name || t('ssid_unset');
+    // 悬停仍给全名：SSID 独占一行后基本不会截断，但极窄屏下仍可能被压
+    document.getElementById('ssid_val').title = shown_name || '';
+    document.getElementById('ip_val').textContent = shown_ip || '—';
     renderProvisioningAp(j);
-    renderWorkMode(j);
+    renderNetPage(j);
     // 配置口 GPIO（-1 = 该功能编译期未启用）：两种状态整块切换，
     // 未启用时展示说明块而非残缺的接线行
     const console_ok = j.console_tx >= 0 && j.console_rx >= 0;
@@ -657,37 +750,82 @@ async function refreshDevices() {
     box.appendChild(table);
 }
 
-async function saveWifi() {
+// 保存网络设置：连接选择 + 凭据一起提交。两件事都可能断开当前 WiFi
+// （本页多半正跑在这条 WiFi 上），所以动手前先弹确认，把后果说清楚
+async function saveNet() {
     const ssid = document.getElementById('ssid').value.trim();
-    if (!ssid) {
-        setMsg(t('err_ssid_required'), 'err');
+    // 勾了"无密码"就按空密码提交（此时密码框已禁用，里面残留的只是没提交的草稿）
+    const want_open = document.getElementById('open_net').checked;
+    const pass = want_open ? '' : document.getElementById('password').value;
+
+    // 先判"有没有改动"再校验：什么都没动时直说，别拿校验提示烦人
+    const mode_changed = want_connect !== cur_connect;
+    const cred_changed = want_connect && (ssid !== cur_ssid || want_open || pass !== '');
+    if (!mode_changed && !cred_changed) {
+        setMsg(t('net_no_change'), 'err');
         return;
     }
-    const pass = document.getElementById('password').value;
-    // 按 UTF-8 字节算（同 saveAp）：固件与 WPA2 校验的都是字节长度；空 = 开放网络
-    if (pass && new TextEncoder().encode(pass).length < 8) {
-        setMsg(t('err_password_too_short'), 'err');
-        return;
+
+    // 只在"连接"且这次真会提交凭据时校验：只切模式（如从热点模式切回连接，
+    // 沿用已存的 SSID/密码自动重连）时凭据框根本不参与提交，不该拦人
+    if (want_connect && cred_changed) {
+        if (!ssid) {
+            setMsg(t('err_ssid_required'), 'err');
+            return;
+        }
+        // 空密码必须显式勾选"无密码"：不再有"留空 = 开放"的静默含义，否则
+        // 改 SSID 时漏填密码会把新网稀里糊涂配成开放
+        if (!want_open && pass === '') {
+            setMsg(t('err_pass_or_open'), 'err');
+            return;
+        }
+        // 按 UTF-8 字节算（同 saveAp）：固件与 WPA2 校验的都是字节长度
+        if (pass && new TextEncoder().encode(pass).length < 8) {
+            setMsg(t('err_password_too_short'), 'err');
+            return;
+        }
     }
+
+    // 只切模式（不提交凭据）时没有新 SSID 可报，单独一条文案：拿 confirm_save
+    // 去填会显示成"去连「」"
+    const confirm_key = !want_connect ? 'confirm_disconnect'
+                                      : (cred_changed ? 'confirm_save' : 'confirm_reconnect');
+    if (!confirm(t(confirm_key, ssid))) return;
+
     // 固件要等实连结果（最长 15 秒）才应答，期间禁用按钮防重复提交
     const btn = document.getElementById('savebtn');
     btn.disabled = true;
     setMsg(t('connecting'));
 
-    const opts = {
+    // 两个请求可能前后脚排在固件的同一个配置队列里，超时都要给够；
+    // 老浏览器没有 AbortSignal.timeout 就不设，一直等固件应答
+    const reqOpts = (body) => ({
         method: 'POST',
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-        body: 'ssid=' + encodeURIComponent(ssid) + '&password=' + encodeURIComponent(pass)
-    };
-    // 本端超时略大于固件的等待上限；老浏览器没有 AbortSignal.timeout 就不设，
-    // 一直等固件应答
-    if (typeof AbortSignal.timeout === 'function') {
-        opts.signal = AbortSignal.timeout(20000);
-    }
+        body: body,
+        signal: typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(20000) : undefined
+    });
 
     let j;
+    // /api/mode 是否已提交成功：随后的 /api/wifi 失败时，提示必须带上"模式已生效"，
+    // 不能整体报失败（见下面的 else if）
+    let mode_done = false;
     try {
-        j = await (await fetch('/api/wifi', opts)).json();
+        // 先切模式：它决定设备连不连 WiFi，凭据只在"连接"模式下才有意义
+        if (mode_changed) {
+            j = await (await fetch('/api/mode', reqOpts('mode=' + (want_connect ? 'sta' : 'ap')))).json();
+            if (!(j && j.ok)) {
+                setMsg(t('save_failed', tErr(j && j.code)), 'err');
+                btn.disabled = false;
+                refreshWifi();
+                return;
+            }
+            mode_done = true;
+        }
+        if (cred_changed) {
+            j = await (await fetch('/api/wifi', reqOpts(
+                'ssid=' + encodeURIComponent(ssid) + '&password=' + encodeURIComponent(pass)))).json();
+        }
     } catch (e) {
         // 换到别的 AP 后本机 IP 变化，响应送不到旧连接属正常；配置是否已保存
         // 取决于固件侧的连接结果，用新 IP 打开本页即可看到
@@ -698,7 +836,37 @@ async function saveWifi() {
     }
     btn.disabled = false;
     if (j && j.ok) {
-        setMsg(t('save_ok') + (j.ip ? '\nIP: ' + j.ip : ''), 'ok');
+        if (want_connect && cred_changed) {
+            // 凭据真提交过且成功 = 设备已连上新 WiFi
+            if (j.persisted === false) {
+                // 连上了但 NVS 写失败（设备存储异常）：如实说"重启后会回退"，
+                // 别用 save_ok 把"已保存"报出去
+                setMsg(t('save_ok_no_persist'), 'ok');
+            } else {
+                setMsg(t('save_ok') + (j.ip ? '\nIP: ' + j.ip : ''), 'ok');
+            }
+            // 提交过的凭据草稿归位：密码框不留明文（框本就不预填，留着会被
+            // 当成"已保存的密码"）；"无密码"勾选也撤销，免得下次设带密码的
+            // 网络时看到密码框还是禁用的一头雾水
+            document.getElementById('password').value = '';
+            const open_chk = document.getElementById('open_net');
+            if (open_chk.checked) {
+                open_chk.checked = false;
+                toggleOpenNet();
+            }
+            ssid_dirty = false;
+        } else {
+            // 只切了模式：模式切换已生效 ≠ WiFi 已连上，别报"连接成功"。
+            // 名称框里是用户没提交的草稿，脏标记保持——上面清掉的话轮询
+            // 会把它覆盖回设备当前值，切回来时草稿就没了
+            setMsg(t(want_connect ? 'mode_saved_sta' : 'mode_saved_ap'), 'ok');
+        }
+        // 提交成功，选择不再是"未提交"状态，交回给轮询同步
+        connect_dirty = false;
+    } else if (mode_done) {
+        // 模式已切成功、凭据提交失败：措辞带上"模式已生效"，整体报失败会与
+        // 设备当前状态不符
+        setMsg(t('mode_switched_wifi_failed', tErr(j && j.code)), 'err');
     } else {
         setMsg(t('save_failed', tErr(j && j.code)), 'err');
     }
@@ -746,37 +914,6 @@ async function saveAp() {
         setApMsg(t('ap_saved', ssid), 'ok');
     } else {
         setApMsg(t('ap_save_failed', tErr(j && j.code)), 'err');
-    }
-    refreshWifi();
-}
-
-// 工作模式点击即切换：切 AP 会断开 WiFi、切 STA 会立刻开始重连，两者都可能
-// 让本机换网络，所以失败分支也提示按新网络重开页面
-async function setWorkMode(mode) {
-    const btn = document.getElementById('mode_' + mode);
-    btn.disabled = true;
-    const opts = {
-        method: 'POST',
-        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-        body: 'mode=' + encodeURIComponent(mode)
-    };
-    // 同 saveAp：可能排在"保存并重连"后面才轮到（固件端配置操作串行）
-    if (typeof AbortSignal.timeout === 'function') {
-        opts.signal = AbortSignal.timeout(20000);
-    }
-    let j;
-    try {
-        j = await (await fetch('/api/mode', opts)).json();
-    } catch (e) {
-        setModeMsg(t('mode_no_response'), 'err');
-        btn.disabled = false;
-        return;
-    }
-    btn.disabled = false;
-    if (j && j.ok) {
-        setModeMsg(t(mode === 'ap' ? 'mode_ap_ok' : 'mode_sta_ok'), 'ok');
-    } else {
-        setModeMsg(t('mode_fail', tErr(j && j.code)), 'err');
     }
     refreshWifi();
 }

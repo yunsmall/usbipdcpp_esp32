@@ -23,6 +23,15 @@
 #include "WifiConnection.h"
 #include "sdkconfig.h"
 
+// 配置口和系统日志口是同一个 UART 的话两个功能会抢同一个串口（Kconfig 的 help
+// 只有文字提醒，这里升级成编译期硬检查）。console 不是 UART（如 USB-Serial-JTAG）
+// 时 CONFIG_ESP_CONSOLE_UART_NUM 未定义或为负，不会误报
+#if CONFIG_USBIPD_CFG_CONSOLE_ENABLE && defined(CONFIG_ESP_CONSOLE_UART_NUM) && \
+        CONFIG_ESP_CONSOLE_UART_NUM >= 0 && \
+        CONFIG_ESP_CONSOLE_UART_NUM == CONFIG_USBIPD_CFG_UART_NUM
+#error "USBIPD_CFG_UART_NUM 与 CONFIG_ESP_CONSOLE_UART_NUM 相同：配置口会和系统日志抢同一个串口"
+#endif
+
 namespace
 {
 
@@ -102,12 +111,12 @@ private:
 };
 
 // 配置口 UART 号（Kconfig 编译期常量；REPL、镜像钩子、日志镜像命令共用这一份）
-uart_port_t s_config_uart_port = static_cast<uart_port_t>(CONFIG_USBIPD_CFG_UART_NUM);
+constexpr uart_port_t s_config_uart_port = static_cast<uart_port_t>(CONFIG_USBIPD_CFG_UART_NUM);
 
 } // anonymous namespace
 
 // 与头文件 static 成员定义一一对应
-vprintf_like_t ConfigConsole::s_orig_log_vprintf = nullptr;
+std::atomic<vprintf_like_t> ConfigConsole::s_orig_log_vprintf{nullptr};
 
 ConfigConsole &ConfigConsole::instance()
 {
@@ -121,10 +130,22 @@ int ConfigConsole::mirror_log_vprintf(const char *fmt, va_list args)
     // 只 va_end 自己 va_copy 出来的复制品：args 是调用方 va_start 出来的，
     // 归调用方 va_end（对同一条 va_list 二次 end 是未定义行为）
     int ret = 0;
-    if (s_orig_log_vprintf != nullptr) {
+    const vprintf_like_t orig = s_orig_log_vprintf.load();
+    if (orig != nullptr) {
         va_list args_uart0;
         va_copy(args_uart0, args);
-        ret = s_orig_log_vprintf(fmt, args_uart0);
+        ret = orig(fmt, args_uart0);
+        va_end(args_uart0);
+    }
+    else {
+        // 装钩子和保存旧实现之间有个极短窗口（见 init 里那行赋值的注释），
+        // 此刻读到的还是 nullptr。就这么跳过的话，这几行日志会从 UART0 上
+        // 彻底消失——退回 libc 的 stdout 兜底：IDF 的 console 本来就接在
+        // 那儿，目的地是同一个。REPL 是在 init 的更靠后处才启动的，窗口期
+        // stdout 还接在 UART0 上，不存在"兜底把日志写去配置口"的情况
+        va_list args_uart0;
+        va_copy(args_uart0, args);
+        ret = vprintf(fmt, args_uart0);
         va_end(args_uart0);
     }
 
@@ -247,9 +268,17 @@ int cmd_wifi_set(int argc, char **argv)
 
     // apply_config 要等到实连结果（最长十几秒）才返回，先给提示免得像卡死
     printf("正在连接 \"%s\"（最多等 %d 秒）...\n", ssid, WifiConfigManager::APPLY_TIMEOUT_SECONDS);
-    esp_err_t err = WifiConfigManager::instance().apply_config(ssid, password);
+    bool persisted = false;
+    esp_err_t err = WifiConfigManager::instance().apply_config(ssid, password, &persisted);
     if (err == ESP_OK) {
-        printf("\n连接成功，配置已保存（重启后仍生效）\n");
+        // NVS 写失败时 apply_config 仍按成功返回（连接已切过去）：提示如实分岔，
+        // 别把"重启后回退"说成"已保存"
+        if (persisted) {
+            printf("\n连接成功，配置已保存（重启后仍生效）\n");
+        }
+        else {
+            printf("\n连接成功，但配置没能写入 NVS（重启后会回退到原配置）\n");
+        }
         return 0;
     }
     // 失败：先一行说明原因，再一行说明配置的去向
@@ -388,6 +417,9 @@ int cmd_logs(int argc, char **argv)
     // 因此本命令自行轮询配置口 RX 收 0x03 作为退出信号。
     // 依赖 esp_console 当前的行为（命令在 REPL 任务里同步执行、期间不读 RX）；
     // 若哪天 REPL 改成边执行边收输入，这里就会与它抢 RX，得改成事件通知退出
+    // flush 清的是上次"退出时连按 Ctrl-C"留下的残余 0x03：不清的话进入本命令
+    // 会立刻读到它而秒退。回车后马上又按的 Ctrl-C 也可能被这次清掉——缓冲里
+    // 没有时间戳分不出两者，只能取更常见的"连按遗留"优先
     uart_flush_input(s_config_uart_port);
     // 提示先于开关：printf 直接写配置口、不走镜像那把锁（s_mirror_write_mutex），
     // 先开镜像的话这行提示可能和别的线程的日志交错成半行
@@ -406,7 +438,12 @@ int cmd_logs(int argc, char **argv)
     ConfigConsole::set_log_mirror(false);
     // 清掉镜像期间用户可能误输入的残余字节，避免下一条命令被吞首字符
     uart_flush_input(s_config_uart_port);
-    printf("\n日志镜像已停止\n");
+    {
+        // set_log_mirror(false) 只挡得住后来的调用：已经进了临界区的那行日志
+        // 可能还在写同一根 UART。这行提示进同一把锁，免得两段字节交错
+        std::lock_guard lock(s_mirror_write_mutex);
+        printf("\n日志镜像已停止\n");
+    }
     return 0;
 }
 
@@ -484,7 +521,10 @@ int cmd_mem(int argc, char **argv)
     return 0;
 }
 
-// argtable 参数声明（init 里注册命令前调用一次）
+// argtable 参数声明（init 里注册命令前调用一次）。
+// arg_end(n) 的 n 是"最多显示几条错误"的槽位容量，与校验松紧无关：多余参数
+// 无论 n 取几都一律报错（arg_parse_untagged 会把每个未匹配 token 都注册成错误，
+// 实测 `wifi_set a b c` 即 nerrors=1），n=2 只是多留一条错误的显示位
 void register_console_command_argtables()
 {
     s_wifi_set_args.ssid = arg_str1(nullptr, nullptr, "<ssid>", "目标 WiFi 名称");
@@ -549,7 +589,10 @@ esp_err_t ConfigConsole::init_repl_and_mirror()
         logger->sinks().push_back(mirror_sink);
     }
 
-    s_orig_log_vprintf = esp_log_set_vprintf(&ConfigConsole::mirror_log_vprintf);
+    // C++17 起赋值先算右边：esp_log_set_vprintf 当场把钩子装上，之后才轮到把
+    // 旧实现存进来。这中间若有别处打日志，钩子读到的还是 nullptr——那里用
+    // stdout 兜底（见 mirror_log_vprintf），不会丢行
+    s_orig_log_vprintf.store(esp_log_set_vprintf(&ConfigConsole::mirror_log_vprintf));
 
     // ---------- REPL ----------
     // 命令里的 printf 会写到配置口、不是 UART0：REPL 任务启动时发现本口不是

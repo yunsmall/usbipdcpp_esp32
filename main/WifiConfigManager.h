@@ -87,13 +87,18 @@ public:
      * 不触碰 NVS 与 WiFi。
      * @param ssid 目标 AP 的 SSID
      * @param password AP 密码；空串视为开放 AP
-     * @return ESP_OK 已连上并保存（NVS 写失败也算成功：连接已经生效，只是重启后
-     *         回退旧配置，日志里有 ERROR）；ESP_ERR_TIMEOUT 超时未连上（内存与 STA
-     *         配置均已回滚成旧值）；ESP_FAIL 被 AP 拒绝或找不到 AP（同上回滚）；
-     *         ESP_ERR_INVALID_ARG 参数非法，什么都没动（空/全空白/含空字符/超长的
-     *         ssid，含空字符、超长或不足 8 位的非空密码）；其它错误码 = STA 配置未能写入驱动
+     * @param persisted 出参（可传 nullptr）：返回 ESP_OK 时 true = 配置已写入 NVS，
+     *        false = 已连上但 NVS 写失败（重启后会回退旧配置）；非 ESP_OK 的返回值
+     *        下不承诺内容
+     * @return ESP_OK 已连上（是否写入 NVS 看 persisted 出参：NVS 写失败也算成功——
+     *         连接已经生效，报失败反而与设备当前状态不符，日志里有 ERROR）；
+     *         ESP_ERR_TIMEOUT 超时未连上（内存与 STA 配置均已回滚成旧值）；
+     *         ESP_FAIL 被 AP 拒绝或找不到 AP（同上回滚）；ESP_ERR_INVALID_ARG 参数
+     *         非法，什么都没动（空/全空白/含空字符/超长的 ssid，含空字符、超长或
+     *         不足 8 位的非空密码）；其它错误码 = STA 配置未能写入驱动
      */
-    esp_err_t apply_config(const std::string &ssid, const std::string &password);
+    esp_err_t apply_config(const std::string &ssid, const std::string &password,
+                           bool *persisted = nullptr);
 
     /**
      * @brief apply_config 等待连接结果的上限（秒），console/网页据此向用户措辞

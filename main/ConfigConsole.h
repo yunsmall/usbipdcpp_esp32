@@ -67,8 +67,9 @@ private:
     // esp_log 的自定义 vprintf：UART0 原样输出 + 镜像开启时写到配置口
     static int mirror_log_vprintf(const char *fmt, va_list args);
 
-    // 由 esp_log_set_vprintf 返回的原 vprintf（保持 UART0 输出）
-    static vprintf_like_t s_orig_log_vprintf;
+    // 由 esp_log_set_vprintf 返回的原 vprintf（保持 UART0 输出）。
+    // 装钩子后其它任务随时可能在钩子里读它，用原子避免数据竞争
+    static std::atomic<vprintf_like_t> s_orig_log_vprintf;
 
     // 挂接的 usbip 服务器（devices 命令的数据源，见 set_server 注释）。
     // 启动线程写、REPL 任务读，用原子指针免得构成 data race

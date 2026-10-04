@@ -69,8 +69,6 @@ namespace usbipdcpp
         std::shared_mutex all_host_devices_mutex;
         usb_host_client_handle_t host_client_handle;
 
-        std::mutex thread_cfg_mutex;
-
         static const char* TAG;
     };
 }

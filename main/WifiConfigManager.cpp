@@ -163,7 +163,9 @@ esp_err_t WifiConfigManager::load_config()
 
     // 配网热点配置独立于 STA 配置：缺哪项回退哪项的编译期默认
     std::string stored_ap;
-    if (nvs_read_string(handle, NVS_KEY_AP_SSID, stored_ap) == ESP_OK) {
+    // 空串按未配置处理，与 STA 侧一致：NVS 里要是真存进了空串（旧版本或手改），
+    // 热点会拿着空 SSID 起不来，只有回退编译期默认才救得回来
+    if (nvs_read_string(handle, NVS_KEY_AP_SSID, stored_ap) == ESP_OK && !stored_ap.empty()) {
         ap_ssid_ = stored_ap;
     }
     else {
@@ -206,7 +208,16 @@ esp_err_t WifiConfigManager::switch_sta_config(const std::string &ssid, const st
     esp_wifi_disconnect();
 
     if (ssid.empty()) {
-        // 空 SSID（仅回滚到"从未配置过"时出现）没有可连的目标，只断开、不 set_config
+        // 空 SSID（仅回滚到"从未配置过"时出现）没有可连的目标：把驱动里残留的
+        // 配置（正是刚刚失败的那个）也清掉，不然重连线程的下一次 connect 会拿它
+        // 继续去连。全零结构体即 ssid_len 为 0 的"未配置"态，之后 connect 会因
+        // 没有 SSID 直接失败
+        wifi_config_t empty_config{};
+        const esp_err_t clear_err = esp_wifi_set_config(WIFI_IF_STA, &empty_config);
+        if (clear_err != ESP_OK) {
+            // 清不掉只记日志：返回 ESP_OK，保持"空 SSID 没有可连目标"的语义
+            ESP_LOGW(TAG, "清空 STA 配置失败: %s", esp_err_to_name(clear_err));
+        }
         return ESP_OK;
     }
 
@@ -237,8 +248,14 @@ esp_err_t WifiConfigManager::switch_sta_config(const std::string &ssid, const st
     return ESP_OK;
 }
 
-esp_err_t WifiConfigManager::apply_config(const std::string &ssid, const std::string &password)
+esp_err_t WifiConfigManager::apply_config(const std::string &ssid, const std::string &password,
+                                          bool *persisted)
 {
+    // 先置"未持久化"：下面任何提前返回（参数非法、切换失败、超时回滚）都没写 NVS，
+    // 成功路径写到 NVS 后再按真实结果覆盖
+    if (persisted != nullptr) {
+        *persisted = false;
+    }
     // 上限取 MAX_SSID_LEN-1：32 字节 SSID 虽然合规，但 STA 配置的 ssid[32] 没有
     // 终止符空间、长度判定要看驱动怎么处理（配网热点那边有显式 ssid_len 才敢填满），
     // 保守拒绝，代价是放不进去一个 32 字节的 SSID。
@@ -303,9 +320,13 @@ esp_err_t WifiConfigManager::apply_config(const std::string &ssid, const std::st
 
     // 连上才持久化。NVS 写失败只记日志、仍按成功返回：网络已经切过去了，报失败
     // 反而与设备当前状态不符（用户会以为没生效而反复操作）；NVS 写失败只可能是
-    // flash 损坏/分区写满这类要重启或维修的情形，调用方没有可执行的补救动作，
-    // 日志里已写明"重启后会回退旧配置"
+    // flash 损坏/分区写满这类要重启或维修的情形，调用方没有可执行的补救动作。
+    // 结果经 persisted 出参带给调用方，让 console/网页的提示如实区分"已保存"
+    // 与"已连上但重启后会回退"
     err = nvs_write_all({{NVS_KEY_SSID, ssid.c_str()}, {NVS_KEY_PASSWORD, password.c_str()}});
+    if (persisted != nullptr) {
+        *persisted = (err == ESP_OK);
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "NVS 写入失败（连接已生效，但重启后会回退旧配置）: %s", esp_err_to_name(err));
     }
@@ -317,6 +338,10 @@ esp_err_t WifiConfigManager::apply_config(const std::string &ssid, const std::st
         std::lock_guard lock(mutex_);
         ssid_ = ssid;
         password_ = password;
+        // 这里不复查连接状态：从"判定成功"到现在之间（含上面的 NVS 写入）若断开，
+        // 重连线程会立刻重连；重连不上时下一次断开事件（那时状态已不是 Switching）
+        // 会把状态拉回 Connecting，看门狗的热点兜底照常。为这几秒的显示误差去复查，
+        // 反而得在"回滚刚验证可用的配置"和"硬报失败"之间做没必要的取舍
         set_state_locked(WifiState::Connected);
         // 能连上说明用户的期望就是"连 WiFi"：期望模式一并落定，免得在 AP 模式下
         // 配好网、重启后模式仍记着 AP 又不连。这里直接改内存——不能调
@@ -353,7 +378,9 @@ bool WifiConfigManager::wait_connection_result(const std::string &ssid,
     //
     // 事件驱动：WiFi 事件回调（note_*）在结果出现时唤醒本线程，不轮询。条件检查
     // 在等待锁内做——事件回调更新状态也要拿同一把锁，于是"检查未满足 → 进入等待"
-    // 与"事件到达"之间不会交错，不会漏掉唤醒（否则要干等到超时）
+    // 与"事件到达"之间不会交错，不会漏掉唤醒（否则要干等到超时）。
+    // 事件驱动也没有轮询的采样问题：断开与重连成功之间必然有 DISCONNECTED、
+    // GOT_IP 等事件，每次唤醒都复查判据，不存在"两次采样之间错过未关联窗口"
     bool connected = false;
     rejected = false;
     // 锁只圈住本函数：调用方随后的回滚要重入 switch_sta_config 拿这把锁
@@ -429,7 +456,9 @@ void WifiConfigManager::rollback_after_failed_switch(const std::string &old_ssid
 void WifiConfigManager::note_disconnect_reason(int reason)
 {
     // 更新在等待锁内、唤醒在锁外：与 apply_config 的"检查条件 → 进入等待"互斥，
-    // 结果不会落在两者之间的窗口里被漏掉
+    // 结果不会落在两者之间的窗口里被漏掉。notify 放在锁外只会白唤醒一次
+    // （等待者醒来发现条件还没就绪、继续等），不会丢唤醒——经典丢唤醒的前提是
+    // "更新不在锁内"，这里更新与等待侧的检查由 wait_mutex_ 配对互斥
     {
         std::lock_guard wait_lock(wait_mutex_);
         last_disconnect_reason_ = reason;

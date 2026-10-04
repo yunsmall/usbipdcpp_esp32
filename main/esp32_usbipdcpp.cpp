@@ -256,11 +256,17 @@ int thread_main() {
 
 extern "C" void app_main(void) {
     // 必须把主流程包进 std::thread（esp_pthread → FreeRTOS 任务）再 join：
-    // spdlog 的并发安全依赖 pthread 原语（mutex/guard/once），而 pthread 环境只对
-    // pthread_create 创建的任务完整注册——app_main 的 main task 不是 pthread 创建的，
-    // 直接在 main task 里跑 thread_main（首次打 spdlog 日志即初始化并发原语）会崩
-    // （实测）。join 在这里实际永不返回（thread_main 自己 while(true)），作用是让
-    // app_main 不退出、main task 常驻
+    // spdlog 初始化会走 pthread_self()，而它要在 pthread_create 的任务登记表里
+    // 查当前任务、查不到直接 assert 崩（IDF 实现如此）。app_main 的 main task
+    // 不在表里，直接在 main task 里跑 thread_main（首次打 spdlog 日志即触发）
+    // 会崩（实测）。注意这条限制只限 pthread_self/this_thread::get_id 这类"查
+    // 登记表"的函数：std::mutex/condition_variable 等同步原语是对象自带的
+    // FreeRTOS 信号量，不查表，任何任务（httpd/REPL/sys_evt 等）里都可用。
+    // join 在这里实际永不返回（thread_main 自己 while(true)），作用是让
+    // app_main 不退出、main task 常驻。
+    // 栈用 pthread 默认（3K）就行：实机跑完整启动链和常驻循环都没爆过；不显式
+    // 加大——pthread 栈从内部 RAM 分配，加大就是从 USB/IP 传输 buffer 的内存池里
+    // 抢（审核建议过加到 8K，按内存账不采纳）
     std::thread main_thread([]() {
         ESP_LOGI(TAG, "启动主线程main函数");
         thread_main();

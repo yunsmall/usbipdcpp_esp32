@@ -326,9 +326,9 @@ void usbipdcpp::Esp32Server::unbind_host_device(usb_device_handle_t dev) {
 }
 
 usbipdcpp::error_code usbipdcpp::Esp32Server::start(asio::ip::tcp::endpoint &ep) {
-    // 设置线程栈，减少内存占用。加锁防止多线程并发修改全局 pthread 配置
+    // 设置线程栈，减少内存占用。esp_pthread 配置存在当前线程的 TLS 里，
+    // 只影响本线程之后创建的线程，多线程各设各的，无需互斥
     server.set_before_thread_create_callback([this](ThreadPurpose purpose) {
-        thread_cfg_mutex.lock();
         esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
         cfg.pin_to_core = 1;
         switch (purpose) {
@@ -352,11 +352,11 @@ usbipdcpp::error_code usbipdcpp::Esp32Server::start(asio::ip::tcp::endpoint &ep)
         esp_pthread_set_cfg(&cfg);
     });
     // 第二参数是线程指针，nullptr 表示线程创建失败（库保证 before/after
-    // 成对调用）。本回调不访问线程对象，只恢复配置并解锁，两种路径一致
+    // 成对调用）。本回调不访问线程对象，只恢复配置，两种路径一致
     server.set_after_thread_create_callback([this](ThreadPurpose, std::thread *) {
+        // 恢复默认，避免残留配置影响本线程之后创建的线程
         esp_pthread_cfg_t default_cfg = esp_pthread_get_default_config();
         esp_pthread_set_cfg(&default_cfg);
-        thread_cfg_mutex.unlock();
     });
 
     // Server::start 不抛异常，错误通过返回值报告（便于无异常环境的嵌入式平台）
@@ -367,9 +367,6 @@ usbipdcpp::error_code usbipdcpp::Esp32Server::start(asio::ip::tcp::endpoint &ep)
     }
 
     {
-        // RAII 持锁：std::thread 构造抛异常（资源不足）时锁自动释放，不会
-        // 因未解锁阻塞后续所有线程创建（before/after 回调也用本锁互斥）
-        std::lock_guard cfg_lock(thread_cfg_mutex);
         esp_pthread_cfg_t pthread_cfg = esp_pthread_get_default_config();
         pthread_cfg.pin_to_core = 1;
         pthread_cfg.thread_name = "Esp32Server client_event_thread";
@@ -403,8 +400,8 @@ usbipdcpp::error_code usbipdcpp::Esp32Server::start(asio::ip::tcp::endpoint &ep)
             // 线程创建失败（资源不足）：start 承诺不抛异常，错误通过返回值
             // 报告（与 LibusbServer::start 一致）。调用方按失败处理不再调
             // stop()，这里必须回滚已启动的 server，否则监听端口泄漏。
-            // 锁由 RAII 释放；恢复全局 pthread 默认配置，避免本次设置的
-            // 栈大小/核心亲和性残留影响后续线程创建
+            // 恢复默认配置，避免本次设置的栈大小/核心亲和性残留
+            // 影响后续线程创建
             SPDLOG_ERROR("创建 client event 线程失败：{}", e.what());
             esp_pthread_cfg_t default_cfg = esp_pthread_get_default_config();
             esp_pthread_set_cfg(&default_cfg);

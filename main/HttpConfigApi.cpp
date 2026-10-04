@@ -175,6 +175,9 @@ void HttpConfigApi::set_server(usbipdcpp::Esp32Server *server)
 esp_err_t HttpConfigApi::handle_get_index(httpd_req_t *req)
 {
     // 网页本体在 main/web/index.html（独立文件便于维护与预览），编译期嵌入固件
+    // no-store：页面必须与固件同版本（错误文案、字段都写在页面里），禁止浏览器
+    // 拿缓存里的旧页面配新固件，出现"字段对不上"的显示错乱
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     return httpd_resp_send(req, index_html_start, index_html_end - index_html_start);
 }
@@ -195,21 +198,23 @@ esp_err_t HttpConfigApi::handle_get_status(httpd_req_t *req)
 
     // ap_active/ap_ssid：页面在配网模式下（连的就是设备热点）要显示热点信息。
     // ap_auth 只报"有没有密码"不下发密码本身——页面据此提示"改名称时密码框
-    // 留空会把热点改成开放的"，避免在页面上泄露已有的密码
+    // 留空会把热点改成开放的"，避免在页面上泄露已有的密码。wifi_auth 同理，
+    // 供网络页密码栏旁显示当前配置有没有密码
     // 留 768 而不是紧凑值：两个 SSID 都可能含控制字符，json_escape 按 \uXXXX
-    // 转义时单字节膨胀到 6 倍（最坏 31*6*2 + 固定部分 ≈ 530 字节）
+    // 转义时单字节膨胀到 6 倍（最坏 31*6*2 + 固定部分 ≈ 550 字节）
     // 字符串字段一律在拼接处就地转义（改成预先转义过的变量极易被再转一次，
     // 显示出来就多一层反斜杠）：每个值只过一次 json_escape，一次都不能多
     char body[768];
     const int body_len = std::snprintf(body, sizeof(body),
                   "{\"connected\":%s,\"ssid\":\"%s\",\"ip\":\"%s\",\"console_tx\":%d,\"console_rx\":%d,"
-                  "\"ap_active\":%s,\"ap_ssid\":\"%s\",\"ap_auth\":%s,\"work_mode\":\"%s\"}",
+                  "\"ap_active\":%s,\"ap_ssid\":\"%s\",\"ap_auth\":%s,\"wifi_auth\":%s,\"work_mode\":\"%s\"}",
                   manager.is_connected() ? "true" : "false",
                   json_escape(manager.ssid()).c_str(), json_escape(manager.ip_str()).c_str(),
                   console_tx, console_rx,
                   WifiConnection::instance().is_ap_active() ? "true" : "false",
                   json_escape(manager.ap_ssid()).c_str(),
                   manager.ap_password().empty() ? "false" : "true",
+                  manager.password().empty() ? "false" : "true",
                   WifiConfigManager::work_mode_name(manager.work_mode()));
     if (body_len < 0 || static_cast<std::size_t>(body_len) >= sizeof(body)) {
         // 以后加字段或 SSID 全是待转义字符时可能顶到上限：宁可报错，也别把截断
@@ -305,12 +310,15 @@ esp_err_t HttpConfigApi::handle_post_wifi(httpd_req_t *req)
     // 同步等连接结果（最长 APPLY_TIMEOUT_SECONDS 秒）：连上才算成功、才保存进
     // NVS，页面据此显示"连接中"并展示结果。换 AP 后本机 IP 变化，这条响应可能
     // 送不到旧连接（页面端有兜底提示）；只要响应送达，结果一定是准的
-    esp_err_t err = manager.apply_config(ssid, password);
+    bool persisted = false;
+    esp_err_t err = manager.apply_config(ssid, password, &persisted);
     if (err == ESP_OK) {
         // 响应另起名字：上面的 body 是请求体，同名会遮蔽（读起来容易看错）
         char resp[96];
-        std::snprintf(resp, sizeof(resp), "{\"ok\":true,\"ip\":\"%s\"}",
-                      json_escape(manager.ip_str()).c_str());
+        // persisted 让页面把"NVS 写失败、重启后会回退"如实标出，不笼统报"已保存"。
+        // 96 字节依旧够：全部字段加最长 ip 才 50 出头
+        std::snprintf(resp, sizeof(resp), "{\"ok\":true,\"ip\":\"%s\",\"persisted\":%s}",
+                      json_escape(manager.ip_str()).c_str(), persisted ? "true" : "false");
         return send_json(req, 200, resp);
     }
     if (err == ESP_ERR_TIMEOUT) {
@@ -385,11 +393,9 @@ esp_err_t HttpConfigApi::handle_post_mode(httpd_req_t *req)
     if (!form_value(body, "mode", mode) || !WifiConfigManager::parse_work_mode(mode, work_mode)) {
         return send_json(req, 400, "{\"code\":\"bad_mode\"}");
     }
-    const esp_err_t err = WifiConfigManager::instance().set_work_mode(work_mode);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "设置工作模式失败: %s", esp_err_to_name(err));
-        return send_json(req, 200, "{\"ok\":false,\"code\":\"mode_save_failed\"}");
-    }
+    // set_work_mode 恒返回 ESP_OK（NVS 写失败也算成功，见其文档）：模式与切换
+    // 动作都已生效，这里报失败反而与设备当前状态不符，故没有失败分支
+    WifiConfigManager::instance().set_work_mode(work_mode);
     return send_json(req, 200, "{\"ok\":true}");
 }
 
