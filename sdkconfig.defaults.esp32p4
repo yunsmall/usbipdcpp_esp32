@@ -34,6 +34,15 @@ CONFIG_SPI_FLASH_SUPPORT_GD_CHIP=y
 CONFIG_SPI_FLASH_SUPPORT_WINBOND_CHIP=y
 CONFIG_SPI_FLASH_SUPPORT_BOYA_CHIP=y
 CONFIG_SPI_FLASH_SUPPORT_TH_CHIP=y
-CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=512
+# 枚举时读取配置描述符的控制传输缓冲区大小。IDF 默认 256，配置描述符超过
+# 这个值（多接口的 UVC/复合设备）会直接枚举失败：enum.c 的
+# parse_short_config_desc 拿 wTotalLength 和它比较，超了报
+# "Configuration descriptor larger than control transfer max length"，
+# 随后 EXT_PORT 禁用端口，设备根本不会出现在 USB/IP 设备列表里
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024
 CONFIG_USB_HOST_HUBS_SUPPORTED=y
 CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=y
+# P4 的 bootloader 用默认 INFO 日志时镜像 0x60f0，超过分区表偏移 0x8000
+# 允许的 bootloader 上限 0x6000，check_sizes.py 直接报错；降到 ERROR 能省掉
+# INFO/WARN 的日志字符串和调用，给 CI 的 riscv 工具链留出余量
+CONFIG_BOOTLOADER_LOG_LEVEL_ERROR=y
