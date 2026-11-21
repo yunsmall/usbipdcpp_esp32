@@ -16,9 +16,8 @@ const char *usbipdcpp::Esp32Server::TAG = "esp32_uspipdcpp_server";
 
 usbipdcpp::Esp32Server::Esp32Server():
     host_client_handle(nullptr) {
-    server.register_session_exit_callback([this]() {
-        this->on_session_exit();
-    });
+    // 物理移除的设备由 Server::release_device 在会话退出路径直接丢弃
+    // （见 usbipdcpp 的 is_device_removed 语义），这里不再注册会话退出回调
 }
 
 void usbipdcpp::Esp32Server::init_client() {
@@ -204,7 +203,12 @@ esp_err_t usbipdcpp::Esp32Server::bind_host_device(usb_device_handle_t dev) {
             endpoints.emplace_back(
                     ep_desc->bEndpointAddress,
                     ep_desc->bmAttributes,
-                    ep_desc->wMaxPacketSize,
+                    // 只取低 11 位：wMaxPacketSize 高 2 位是高速端点的附加
+                    // 事务数 / 超速 mult 编码，不是包长。hcd_dwc.c 用
+                    // USB_EP_DESC_GET_MPS（usb_types_ch9.h，掩码 0x07FF）取
+                    // MPS 并据此切分 QTD、校验 IN 长度对齐，这里必须与它一致，
+                    // 否则对齐/上限计算全部偏移
+                    USB_EP_DESC_GET_MPS(ep_desc),
                     ep_desc->bInterval
                     );
         }
@@ -507,20 +511,6 @@ void usbipdcpp::Esp32Server::stop() {
 }
 
 usbipdcpp::Esp32Server::~Esp32Server() {
-}
-
-void usbipdcpp::Esp32Server::on_session_exit() {
-    std::lock_guard lock(server.get_devices_mutex());
-    auto &server_using_devices = server.get_using_devices();
-    for (auto it = server_using_devices.begin(); it != server_using_devices.end();) {
-        if (auto handler = it->second->handler) {
-            if (handler->is_device_removed()) {
-                it = server_using_devices.erase(it);
-                continue;
-            }
-        }
-        ++it;
-    }
 }
 
 void usbipdcpp::Esp32Server::remove_gone_device(usb_device_handle_t dev) {

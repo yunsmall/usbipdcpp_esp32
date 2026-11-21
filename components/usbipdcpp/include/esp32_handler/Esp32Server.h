@@ -55,7 +55,6 @@ namespace usbipdcpp
     protected:
         Server server;
 
-        void on_session_exit();
         void remove_gone_device(usb_device_handle_t dev);
 
         static void client_event_callback(const usb_host_client_event_msg_t* event_msg, void* arg);

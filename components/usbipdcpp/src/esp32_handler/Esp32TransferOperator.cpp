@@ -64,9 +64,16 @@ void* Esp32TransferOperator::alloc_transfer_handle(std::size_t buffer_length, in
                  buffer_length, num_iso_packets, header.ep, is_control, actual_buffer_length);
 
     usb_transfer_t* transfer = nullptr;
-    esp_err_t err = usb_host_transfer_alloc(actual_buffer_length, num_iso_packets, &transfer);
+    // 零长度非控制传输是合法的（例如 bulk OUT length=0）：usb_private.c 的
+    // urb_alloc 用 heap_caps_malloc 分配数据缓冲区，而 heap_caps_base.c 的
+    // heap_caps_aligned_alloc_base 对 size==0 直接返回 NULL（ESP-IDF v5.5），
+    // 会把合法请求当成内存不足断开整个会话。只放大分配大小，num_bytes 仍由
+    // receive_urb 按实际长度设置（与 libusb 后端 malloc(0) 改 malloc(1) 同理）
+    const std::size_t alloc_length = actual_buffer_length > 0 ? actual_buffer_length : 1;
+    esp_err_t err = usb_host_transfer_alloc(alloc_length, num_iso_packets, &transfer);
     if (err != ESP_OK) [[unlikely]] {
-        SPDLOG_ERROR("usb_host_transfer_alloc failed: {}, actual={}", esp_err_to_name(err), actual_buffer_length);
+        SPDLOG_ERROR("usb_host_transfer_alloc failed: {}, alloc={}（请求长度 {}）", esp_err_to_name(err),
+                     alloc_length, actual_buffer_length);
         log_heap_diag(TAG);
         return nullptr;
     }
@@ -77,12 +84,31 @@ void* Esp32TransferOperator::alloc_transfer_handle(std::size_t buffer_length, in
     // receive_urb 提交前会按解析出的真实端点覆盖此值（两者正常情况下一致，
     // 客户端方向与端点矛盾时以真实端点为准，方向判断只影响线上数据收发）
     transfer->bEndpointAddress = static_cast<std::uint8_t>(header.ep) | (is_in ? 0x80 : 0);
+    // ISO 传输在这里记录客户端的 transfer_buffer_length：receive_urb 之前
+    // recv_transfer_data 需要用它校验描述符总长。usb_private.c 的 urb_alloc
+    // 把 data_buffer_size 按缓存对齐 ALIGN_UP 放大，不能当客户端长度用；
+    // num_bytes 是 usb_transfer_t 的普通字段（usb_types_stack.h），此处写入，
+    // receive_urb 提交前会覆盖成 transfer_buffer_length（两者相等）
+    if (num_iso_packets > 0) {
+        transfer->num_bytes = static_cast<int>(buffer_length);
+    }
     return transfer;
 }
 
 std::size_t Esp32TransferOperator::get_actual_length(void* transfer_handle)
 {
     auto* trx = static_cast<usb_transfer_t*>(transfer_handle);
+    // 控制传输的 actual_num_bytes 包含 setup 的 8 字节：hcd_dwc.c 的
+    // _buffer_parse_ctrl 用 actual = num_bytes - rem_len（num_bytes 含
+    // setup），无数据阶段时直接写 sizeof(usb_setup_packet_t)。本接口与
+    // libusb 的 actual_length（数据阶段长度）语义对齐，必须扣掉；
+    // transfer_callback 里有同样的处理。无数据阶段时 actual 恰为 8，
+    // 扣完是 0，不能因为"没有大于 8"就把 8 当成数据长度返回
+    if ((trx->bEndpointAddress & 0x7F) == 0) {
+        return trx->actual_num_bytes > USB_SETUP_PACKET_SIZE
+                       ? static_cast<std::size_t>(trx->actual_num_bytes - USB_SETUP_PACKET_SIZE)
+                       : 0;
+    }
     return trx->actual_num_bytes;
 }
 
@@ -187,27 +213,33 @@ void Esp32TransferOperator::recv_transfer_data(void* handle, asio::ip::tcp::sock
     // 是否控制传输（recv 自身无法用其他字段推断：usbh 提交前不设置任何
     // 传输类型/端点信息，transfer 结构由 calloc 清零分配）
     auto offset = ((trx->bEndpointAddress & 0x7F) == 0) ? USB_SETUP_PACKET_SIZE : 0;
-    asio::read(sock, asio::buffer(static_cast<std::uint8_t*>(trx->data_buffer) + offset, length), ec);
-    if (ec)
-        return;
+    // 零长度 URB 没有数据阶段（例如 bulk OUT length=0，合法请求），
+    // asio::read 读 0 字节会立即返回，这里显式跳过只是为了不构造空 buffer
+    if (length > 0) {
+        asio::read(sock, asio::buffer(static_cast<std::uint8_t*>(trx->data_buffer) + offset, length), ec);
+        if (ec)
+            return;
+    }
 
     // 校验并读取 ISO 描述符：length/actual_length 是客户端可控字段，必须验证
     // 才能写入 usb_transfer——usb_host 按 num_bytes 从缓冲区读写数据，length
-    // 总和超过 data_buffer_size 会越界读写，actual_length 超过 length 则包数据
-    // 溢出。不合法拒绝整个命令（调用方 ec 非空时抛异常断开连接）
+    // 总和超过客户端提交的 transfer_buffer_length 会读写未从 socket 读入的
+    // 区域（usb_private.c 的 urb_alloc 把 data_buffer_size 按缓存对齐 ALIGN_UP
+    // 放大，不能用它当上界），actual_length 超过 length 则包数据溢出。不合法
+    // 拒绝整个命令（调用方 ec 非空时抛异常断开连接）
     std::uint64_t total_length = 0;
     for (int i = 0; i < trx->num_isoc_packets; i++) {
         UsbIpIsoPacketDescriptor iso_desc{};
         iso_desc.from_socket(sock);
-        // 校验写成 total_length + length > data_buffer_size：若写成
-        // length > data_buffer_size - total_length，total_length 超过
-        // data_buffer_size 时无符号减法会下溢成巨大值、校验失效（前序校验
-        // 保证 total_length 恒 ≤ data_buffer_size，实际不会触发，但可读性差）
+        // 校验写成 total_length + length > trx->num_bytes：若写成
+        // length > num_bytes - total_length，total_length 超过 num_bytes 时
+        // 无符号减法会下溢成巨大值、校验失效（前序校验保证 total_length 恒
+        // ≤ num_bytes，实际不会触发，但可读性差）
         if (iso_desc.actual_length > iso_desc.length ||
-            total_length + iso_desc.length > static_cast<std::uint64_t>(trx->data_buffer_size)) [[unlikely]] {
+            total_length + iso_desc.length > static_cast<std::uint64_t>(trx->num_bytes)) [[unlikely]] {
             SPDLOG_ERROR("ISO 描述符非法：包 {} length={} actual_length={}（剩余缓冲 {}）",
                          i, iso_desc.length, iso_desc.actual_length,
-                         static_cast<std::uint64_t>(trx->data_buffer_size) - total_length);
+                         static_cast<std::uint64_t>(trx->num_bytes) - total_length);
             ec = std::make_error_code(std::errc::invalid_argument);
             return;
         }

@@ -1,6 +1,7 @@
 #include "esp32_handler/Esp32DeviceHandler.h"
 
 #include <algorithm>
+#include <cstring>
 #include <esp_log.h>
 
 #include "usbipdcpp/Session.h"
@@ -169,6 +170,19 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
 
     // 控制传输：特殊请求处理 + 非控制传输需要接口
     if (is_control) [[unlikely]] {
+        // wLength 大于客户端 URB 的 buffer 长度时必须拒绝：usb_private.c 的
+        // urb_alloc 把分配大小按 cache line ALIGN_UP，data_buffer_size 比请求
+        // 长度大；usbh.c 的 urb_check_args 只比较 num_bytes <= data_buffer_size，
+        // 存在对齐余量大小的绕过窗口，hcd 会读写这段没有从 socket 读入的堆
+        // 内存（控制 OUT 会把未初始化的堆内容发给设备）。与 libusb 后端的
+        // 同名检查一致，回 EPIPE
+        if (setup_packet.length > transfer_buffer_length) [[unlikely]] {
+            SPDLOG_ERROR("控制传输 wLength({}) 大于 transfer_buffer_length({})，拒绝传输",
+                         setup_packet.length, transfer_buffer_length);
+            responder->submit_ret_submit(
+                    UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum, 0));
+            return;
+        }
         auto tweak_ret = tweak_special_requests(setup_packet);
         if (tweak_ret >= 0) {
             // tweak_ret == 0：tweak 成功（CLEAR_FEATURE 已同步完成、SET_INTERFACE
@@ -200,12 +214,11 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
     // num_bytes 和 MPS 对齐
     std::uint32_t num_bytes;
     if (is_control) {
-        // 恶意 wLength 大于 transfer_buffer_length 时 num_bytes 会超过分配的
-        // 缓冲区大小，但不会越界：提交路径（usb_host_transfer_submit_control
-        // → usbh_dev_submit_ctrl_urb、usb_host_transfer_submit →
-        // usbh_ep_enqueue_urb）入口都无条件调 urb_check_args（usbh.c:245）
-        // 检查 num_bytes <= data_buffer_size，超了返回 ESP_ERR_INVALID_ARG，
-        // 进不到 hcd_urb_enqueue 就不会碰数据缓冲区，走下方失败路径回 EPIPE
+        // num_bytes 必须带 setup 前缀：hcd_dwc.c 的 _buffer_fill_ctrl 用
+        // num_bytes - sizeof(usb_setup_packet_t) 填数据阶段（不是 setup.wLength），
+        // usbh.c 的 transfer_check_usb_compliance 也按 num_bytes 与 8 + wLength
+        // 比较。wLength 超过 transfer_buffer_length 的请求上面已经拒绝，这里
+        // 恒有 num_bytes <= 8 + transfer_buffer_length
         num_bytes = USB_SETUP_PACKET_SIZE + setup_packet.length;
     }
     else {
@@ -225,7 +238,112 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
         }
     }
 
+    // 零长度的 interrupt 传输不能提交给 ESP-IDF 的 hcd：hcd_dwc.c 的
+    // _buffer_fill_intr 用 num_qtds = num_bytes / mps 计算描述符数量，0 字节
+    // 得到 0 个 QTD，随后仍以 num_qtds - 1 为索引写 xfer_desc_list[-1]
+    // （数组下溢，破坏相邻内存）；_buffer_exec 还会把 desc_list_len = 0
+    // 传给 usb_dwc_hal_chan_activate。usbh.c 的 transfer_check_usb_compliance
+    // 对非控制 IN 只检查 num_bytes % mps，0 能通过，拦不住。0 长度传输没有
+    // 数据阶段，本地按成功完成应答即可（libusb 后端可以真的提交 0 长度传输，
+    // 这是 hcd 的边界缺陷）
+    if (ep.attributes == static_cast<std::uint8_t>(EndpointAttributes::Interrupt) && num_bytes == 0) {
+        SPDLOG_DEBUG("零长度中断传输，不提交给设备，直接完成");
+        responder->submit_ret_submit(
+                UsbIpResponse::UsbIpRetSubmit::create_ret_submit_ok_without_data(seqnum, 0));
+        return;
+    }
+
     auto *trx = static_cast<usb_transfer_t *>(cmd.transfer.get());
+
+    // 非控制端点的 MPS 必须非 0：usbh.c 的 transfer_check_usb_compliance
+    // 对非控制 IN 用 num_bytes % mps 校验对齐，ISO 对每个包也做同样的取模，
+    // hcd_dwc.c 的 _buffer_fill_intr 同样对 mps 取模，mps 为 0 会直接除零
+    // panic。MPS 取自设备端点描述符（USB_EP_DESC_GET_MPS），畸形描述符会在
+    // 这里被拒绝而不是崩在 hcd 内部。控制传输不在这个范围：hcd_dwc.c 的
+    // 控制路径不按 MPS 取模，用的是 pipe 自己的 MPS（usbh.c 从设备描述符的
+    // bMaxPacketSize0 取得）
+    if (!is_control && ep.max_packet_size == 0) [[unlikely]] {
+        SPDLOG_ERROR("端点 {:02x} 的 MPS 为 0，无法提交给 hcd", ep.address);
+        responder->submit_ret_submit(
+                UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum, 0));
+        return;
+    }
+
+    // ESP-IDF hcd 的描述符列表是编译期固定长度，URB 长度/包数由客户端任意
+    // 指定，超出时 _buffer_fill_intr / _buffer_fill_isoc 里的 assert 直接
+    // panic（不是返回错误），必须在这里提前拒绝
+    if (ep.attributes == static_cast<std::uint8_t>(EndpointAttributes::Interrupt)) {
+        // hcd_dwc.c 的 _buffer_fill_intr：一个 QTD 对应一个 MPS 包，
+        // XFER_LIST_LEN_INTR = FRAME_LIST_LEN = USB_HAL_FRAME_LIST_LEN_32 = 32，
+        // assert 条件为 (zero_len_packet) ? num_qtds + 1 : num_qtds <= 32——
+        // ZERO_PACK 追加的零长度 QTD 单独占一项
+        const std::uint32_t mps = ep.max_packet_size;
+        const std::uint64_t qtds =
+                (static_cast<std::uint64_t>(num_bytes) + mps - 1) / mps;
+        const bool extra_zlp =
+                is_out &&
+                (transfer_flags & static_cast<std::uint32_t>(TransferFlag::URB_ZERO_PACKET)) != 0 &&
+                num_bytes % mps == 0;
+        if (qtds + (extra_zlp ? 1u : 0u) > 32) [[unlikely]] {
+            SPDLOG_ERROR("interrupt 传输 {} 字节（MPS {}）需要 {} 个 QTD，超过 hcd 上限 32，拒绝传输",
+                         num_bytes, mps, qtds + (extra_zlp ? 1u : 0u));
+            responder->submit_ret_submit(
+                    UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum, 0));
+            return;
+        }
+    }
+    else if (ep.attributes == static_cast<std::uint8_t>(EndpointAttributes::Isochronous)) {
+        // hcd_dwc.c 的 _buffer_fill_isoc：total_num_desc = num_isoc_packets *
+        // interval，assert(total_num_desc <= XFER_LIST_LEN_ISOC -
+        // XFER_LIST_ISOC_MARGIN = 64 - 3)；interval 由 bInterval 换算为
+        // 1 << (bInterval - 1)（同一文件的 pipe 配置代码）。bInterval=0 在
+        // IDF 里是未定义的移位，bInterval>16 也不合法，一并拒绝
+        const std::uint32_t binterval = ep.interval;
+        if (binterval == 0 || binterval > 16) [[unlikely]] {
+            SPDLOG_ERROR("ISO 端点 {:02x} 的 bInterval={} 非法，拒绝传输", ep.address, binterval);
+            responder->submit_ret_submit(
+                    UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum, 0));
+            return;
+        }
+        const std::uint64_t interval = std::uint64_t{1} << (binterval - 1);
+        if (trx->num_isoc_packets <= 0 ||
+            static_cast<std::uint64_t>(trx->num_isoc_packets) * interval > 61) [[unlikely]] {
+            SPDLOG_ERROR("ISO 传输 {} 个包（interval {}）超过 hcd 描述符列表容量 61，拒绝传输",
+                         trx->num_isoc_packets, interval);
+            responder->submit_ret_submit(
+                    UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum, 0));
+            return;
+        }
+        // ISO 的 QTD 用 in_iso/out_iso 的 xfer_size:12 字段（hal/usb_dwc_ll.h
+        // 的 usb_dwc_ll_dma_qtd_t），单包超过 4095 字节会被截断：硬件只按低
+        // 12 位长度传输，_buffer_parse_isoc 却按描述符原始 num_bytes 计算
+        // actual，会把没传的缓冲区内容当数据回给客户端。usbh 的 compliance
+        // 只检查包长是 MPS 整数倍和总和，不检查单包上限
+        for (int i = 0; i < trx->num_isoc_packets; i++) {
+            if (static_cast<std::uint32_t>(trx->isoc_packet_desc[i].num_bytes) > 0xFFF) [[unlikely]] {
+                SPDLOG_ERROR("ISO 包 {} 长度 {} 超过 hcd QTD 的 12 位长度上限 4095，拒绝传输",
+                             i, trx->isoc_packet_desc[i].num_bytes);
+                responder->submit_ret_submit(
+                        UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum, 0));
+                return;
+            }
+        }
+    }
+    else if (ep.attributes == static_cast<std::uint8_t>(EndpointAttributes::Bulk)) {
+        // hcd_dwc.c 的 _buffer_fill_bulk 把整个 URB 填进一个 QTD，QTD 的
+        // xfer_size 是 in_non_iso/out_non_iso 的 17 位字段（hal/usb_dwc_ll.h），
+        // 单次 bulk URB 超过 131071 字节会被截断（131072 截成 0）：硬件按
+        // 截断后的长度传，_buffer_parse_bulk 却按 num_bytes - rem_len 报
+        // actual，会把没传的缓冲区内容当数据回给客户端。usbh 和 hcd 都不检查
+        // 这个上限
+        if (num_bytes > 0x1FFFF) [[unlikely]] {
+            SPDLOG_ERROR("bulk 传输 {} 字节超过 hcd 单个 QTD 的 17 位长度上限 131071，拒绝传输",
+                         num_bytes);
+            responder->submit_ret_submit(
+                    UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum, 0));
+            return;
+        }
+    }
 
     // 填充 setup packet 到 buffer 开头
     // OUT 数据已经被 from_socket 写到 buffer + USB_SETUP_PACKET_SIZE 位置
@@ -246,6 +364,9 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
     callback_args->seqnum = seqnum;
     callback_args->is_out = is_out;
     callback_args->original_transfer_buffer_length = transfer_buffer_length;
+    callback_args->short_not_ok =
+            (transfer_flags & static_cast<std::uint32_t>(TransferFlag::URB_SHORT_NOT_OK)) != 0 && !is_out;
+    callback_args->expected_length = is_control ? setup_packet.length : transfer_buffer_length;
     callback_args->transfer = std::move(cmd.transfer);
     // 池对象复用时重置旧值，防止回调误用上一个 session 的状态
     callback_args->unlinked = false;
@@ -265,12 +386,15 @@ void usbipdcpp::Esp32DeviceHandler::receive_urb(
     }
     else if (ep.attributes == static_cast<std::uint8_t>(EndpointAttributes::Bulk)) [[likely]] {
         callback_args->transfer_type = USB_TRANSFER_TYPE_BULK;
-        if (is_out) {
-            // On bulk OUT, USB_TRANSFER_FLAG_ZERO_PACK asks the host to append a
-            // zero-length packet when the payload is an exact multiple of the
-            // endpoint MPS, so the device sees a clean end-of-transfer marker.
-            trx->flags |= USB_TRANSFER_FLAG_ZERO_PACK;
-        }
+        // On bulk OUT, USB_TRANSFER_FLAG_ZERO_PACK asks the host to append a
+        // zero-length packet when the payload is an exact multiple of the
+        // endpoint MPS, so the device sees a clean end-of-transfer marker.
+        // 但不能对 bulk OUT 无条件加：ZERO_PACK 只由客户端 URB_ZERO_PACKET
+        // 决定（trx->flags 的赋值在上面统一走 get_esp32_transfer_flags）。
+        // hcd_dwc.c 的 _buffer_fill_bulk 在 flag 置位且长度为 MPS 整数倍时
+        // 会追加一个零长度 QTD，无条件加会让所有普通 bulk OUT 都多发 ZLP，
+        // 设备看到的数据流与客户端 URB 语义不一致（libusb 后端的
+        // masking_bogus_flags 同样只允许客户端请求的 flag）
         SPDLOG_DEBUG("块传输 {}，ep addr: {:02x}, len: {}, num_bytes: {}",
                      is_out?"Out":"In", ep.address, transfer_buffer_length, num_bytes);
     }
@@ -416,7 +540,8 @@ void usbipdcpp::Esp32DeviceHandler::cancel_endpoint_all_transfers(uint8_t bEndpo
 
 esp_err_t usbipdcpp::Esp32DeviceHandler::sync_control_transfer(const SetupPacket &setup_packet) const {
     usb_transfer_t *transfer = nullptr;
-    auto err = usb_host_transfer_alloc(USB_SETUP_PACKET_SIZE, 0, &transfer);
+    const std::size_t alloc_len = USB_SETUP_PACKET_SIZE + setup_packet.length;
+    auto err = usb_host_transfer_alloc(alloc_len, 0, &transfer);
     {
         if (err != ESP_OK) {
             SPDLOG_ERROR("无法申请transfer");
@@ -429,6 +554,14 @@ esp_err_t usbipdcpp::Esp32DeviceHandler::sync_control_transfer(const SetupPacket
         setup_pkt->wValue = setup_packet.value;
         setup_pkt->wIndex = setup_packet.index;
         setup_pkt->wLength = setup_packet.length;
+        // 数据阶段清零：本函数只用于 CLEAR_FEATURE 这类无数据阶段的请求，
+        // 规范要求 wLength=0，但 is_clear_halt_cmd 不校验 wLength。hcd_dwc.c 的
+        // _buffer_fill_ctrl 按 num_bytes - 8 的长度填数据阶段发给设备，而
+        // usb_private.c 的 urb_alloc 不清零数据缓冲区，畸形请求会把未初始化的
+        // 堆内容当 OUT 数据发出去；按 8 + wLength 分配并清零即可覆盖
+        if (setup_packet.length > 0) {
+            std::memset(transfer->data_buffer + USB_SETUP_PACKET_SIZE, 0, setup_packet.length);
+        }
 
         std::binary_semaphore semaphore{0};
 
@@ -493,8 +626,14 @@ int usbipdcpp::Esp32DeviceHandler::tweak_set_interface_cmd(const SetupPacket &se
 
     SPDLOG_DEBUG("set_interface: inf {} alt {}", interface, alternate);
 
-    // ESP-IDF's usb_host_lib does not currently support dynamic alt-setting
-    // switches. Handling depends on the requested alternate:
+    // ESP-IDF v5.5 没有提供切换 altsetting 的 API：usb_host.h 只有
+    // interface_claim/release，claim 的 bAlternateSetting 只在登记时选择
+    // 端点，不会向设备发 SET_INTERFACE（usb_host.c 的 interface_claim 只按
+    // alt 解析描述符并分配端点）。真正切换需要自己提交 SET_INTERFACE 控制
+    // 请求，再 release/claim 新 alt 重建端点。本后端目前没做这件事：
+    // bind_host_device 只解析并 claim 了 alt 0，UsbDevice 里也只填了 alt 0
+    // 的端点组（UsbInterface::endpoints 本身支持按 altsetting 分组，libusb
+    // 后端就填了全部 alt）。处理取决于请求的 alternate：
     //
     //   * alt 0 — the interface is already at alt 0 after SET_CONFIGURATION,
     //     so a client asking for alt 0 is effectively a no-op. Report
@@ -758,17 +897,44 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
         // 计算 actual_length
         std::uint32_t actual_length = trx->actual_num_bytes;
         bool is_control = (trx->bEndpointAddress & 0x7F) == 0;
-        if (!cb->is_out && is_control) {
-            if (actual_length > USB_SETUP_PACKET_SIZE)
-                actual_length -= USB_SETUP_PACKET_SIZE;
-            else
-                actual_length = 0;
+        // ESP-IDF 的 hcd 对控制传输的 actual_num_bytes 恒包含 setup 阶段的
+        // 8 字节（hcd_dwc.c 的 _buffer_parse_ctrl：actual = num_bytes - rem_len，
+        // 而 num_bytes 含 setup），与 libusb 的 actual_length（不含 setup）
+        // 语义不同。必须不分方向统一扣掉：控制 OUT / 无数据阶段（wLength=0）
+        // 同样带这 8 字节，只扣 IN 会让 vhci 的 urb->actual_length 比真实多 8
+        if (is_control) {
+            actual_length = actual_length > USB_SETUP_PACKET_SIZE
+                                    ? actual_length - USB_SETUP_PACKET_SIZE
+                                    : 0;
         }
         if (trx->num_isoc_packets > 0 && !cb->is_out) {
             std::uint32_t iso_actual = 0;
             for (int i = 0; i < trx->num_isoc_packets; i++)
                 iso_actual += trx->isoc_packet_desc[i].actual_num_bytes;
             actual_length = iso_actual;
+        }
+        else if (!cb->is_out && trx->num_isoc_packets == 0 &&
+                 actual_length > cb->original_transfer_buffer_length) {
+            // IN 传输的 num_bytes 在提交前按 MPS 向上对齐过，hcd_dwc.c 的
+            // _buffer_parse_bulk 用 actual = num_bytes - rem_len，_buffer_parse_intr
+            // 的早停分支也按对齐后的包数换算，设备可能返回比客户端请求更多的
+            // 字节（v5.5.0 的早停公式还多算 mps - 2）。USB/IP 的 actual_length
+            // 不允许超过客户端 URB 的 transfer_buffer_length（vhci 按它校验并
+            // 拷贝），超出会判 URB 失败。ISO 不走这里：描述符 actual 之和必须
+            // 与会话头一致
+            actual_length = cb->original_transfer_buffer_length;
+        }
+
+        // URB_SHORT_NOT_OK：IN 传输实际长度小于客户端期望时按 EPIPE 上报
+        // （与 libusb 后端的 LIBUSB_TRANSFER_SHORT_NOT_OK 一致）。usb_types_stack.h
+        // 的 USB_TRANSFER_FLAG_* 只有 ZERO_PACK 一个（ESP-IDF v5.5），没有对应
+        // 标志，只能比较长度自己实现；期望长度在 receive_urb 里按传输类型取
+        // （控制为 wLength，其余为原始 buffer 长度）
+        usb_transfer_status_t effective_status = trx->status;
+        if (effective_status == USB_TRANSFER_STATUS_COMPLETED && cb->short_not_ok &&
+            cb->transfer_type != USB_TRANSFER_TYPE_ISOCHRONOUS &&
+            actual_length < cb->expected_length) {
+            effective_status = USB_TRANSFER_STATUS_ERROR;
         }
 
         // 统计 ISO 传输中失败的包数（协议 RET_SUBMIT 的 error_count 字段；
@@ -789,7 +955,7 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
             LATENCY_TRACK_END_MSG(*handler->responder->latency_tracker(), cb->unlink_cmd_seqnum, "被unlink");
             handler->responder->enqueue_ret_unlink(
                     UsbIpResponse::UsbIpRetUnlink::create_ret_unlink(
-                            cb->unlink_cmd_seqnum, trxstat2error(trx->status)));
+                            cb->unlink_cmd_seqnum, trxstat2error(effective_status)));
             cb->transfer.reset();
         }
         else {
@@ -801,18 +967,18 @@ void usbipdcpp::Esp32DeviceHandler::transfer_callback(usb_transfer_t *trx) {
                     // 协议要求 ISO 不分方向都返回 number_of_packets 个描述符，且
                     // 描述符 actual_length 之和必须等于 header 的 actual_length
                     ret = UsbIpResponse::UsbIpRetSubmit::create_ret_submit(
-                            cb->seqnum, trxstat2error(trx->status), actual_length,
+                            cb->seqnum, trxstat2error(effective_status), actual_length,
                             0, trx->num_isoc_packets, std::move(cb->transfer));
                 }
                 else {
                     ret = UsbIpResponse::UsbIpRetSubmit::create_ret_submit_with_status_and_no_data(
-                            cb->seqnum, trxstat2error(trx->status), actual_length);
+                            cb->seqnum, trxstat2error(effective_status), actual_length);
                     cb->transfer.reset();
                 }
             }
             else {
                 ret = UsbIpResponse::UsbIpRetSubmit::create_ret_submit(
-                        cb->seqnum, trxstat2error(trx->status),
+                        cb->seqnum, trxstat2error(effective_status),
                         actual_length, 0, trx->num_isoc_packets,
                         std::move(cb->transfer));
             }

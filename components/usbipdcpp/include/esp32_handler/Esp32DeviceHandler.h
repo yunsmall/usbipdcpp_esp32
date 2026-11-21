@@ -36,6 +36,13 @@ namespace usbipdcpp
         bool unlinked = false;                // CMD_UNLINK 已到达
         std::uint32_t unlink_cmd_seqnum = 0;
         std::uint32_t original_transfer_buffer_length = 0;
+        /// 客户端 URB 设置了 URB_SHORT_NOT_OK 且传输为 IN 方向：短包要按
+        /// 错误上报（ESP-IDF 的 usb_transfer 没有对应 flag，需要在回调里
+        /// 自己比较实际长度）
+        bool short_not_ok = false;
+        /// 客户端期望的 IN 数据长度：控制传输是 wLength，其余是原始
+        /// transfer_buffer_length。与 actual_length 比较判断短包
+        std::uint32_t expected_length = 0;
         TransferHandle transfer;  // 拥有 transfer 的所有权
 
         void reset()
@@ -47,6 +54,8 @@ namespace usbipdcpp
             unlinked = false;
             unlink_cmd_seqnum = 0;
             original_transfer_buffer_length = 0;
+            short_not_ok = false;
+            expected_length = 0;
             transfer.reset();
         }
     };
