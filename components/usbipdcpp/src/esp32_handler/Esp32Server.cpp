@@ -1,5 +1,6 @@
 #include "esp32_handler/Esp32Server.h"
 
+#include <algorithm>
 #include <usbipdcpp/Session.h>
 #include <usb/usb_helpers.h>
 #include <esp_log.h>
@@ -11,8 +12,39 @@
 
 #include "esp32_handler/Esp32DeviceHandler.h"
 #include "esp32_handler/tools.h"
+#include "usbipdcpp/utils/SmallVector.h"
 
 const char *usbipdcpp::Esp32Server::TAG = "esp32_uspipdcpp_server";
+
+namespace {
+
+using usbipdcpp::SmallVector;
+
+/// 配置描述符里出现的所有接口号（去重，保持描述符顺序）
+///
+/// IDF 的 usb_parse_interface_descriptor / usb_parse_interface_number_of_alternate /
+/// usb_host_interface_claim / usb_host_interface_release 全部按 bInterfaceNumber
+/// 查找接口，不能拿 0..bNumInterfaces-1 的数组下标当接口号：跳号接口
+/// （只有 0 和 2 之类）用下标会漏接口或操作错接口
+SmallVector<std::uint8_t, 16> collect_interface_numbers(const usb_config_desc_t *config_desc) {
+    SmallVector<std::uint8_t, 16> numbers;    int offset = 0;
+    const usb_standard_desc_t *cur = reinterpret_cast<const usb_standard_desc_t *>(config_desc);
+    const usb_intf_desc_t *intf = reinterpret_cast<const usb_intf_desc_t *>(
+            usb_parse_next_descriptor_of_type(cur, config_desc->wTotalLength,
+                                              USB_B_DESCRIPTOR_TYPE_INTERFACE, &offset));
+    while (intf) {
+        if (std::find(numbers.begin(), numbers.end(), intf->bInterfaceNumber) == numbers.end()) {
+            numbers.push_back(intf->bInterfaceNumber);
+        }
+        cur = reinterpret_cast<const usb_standard_desc_t *>(intf);
+        intf = reinterpret_cast<const usb_intf_desc_t *>(
+                usb_parse_next_descriptor_of_type(cur, config_desc->wTotalLength,
+                                                  USB_B_DESCRIPTOR_TYPE_INTERFACE, &offset));
+    }
+    return numbers;
+}
+
+} // anonymous namespace
 
 usbipdcpp::Esp32Server::Esp32Server():
     host_client_handle(nullptr) {
@@ -105,17 +137,13 @@ void usbipdcpp::Esp32Server::client_event_callback(const usb_host_client_event_m
         auto err = usb_host_get_active_config_descriptor(event_msg->dev_gone.dev_hdl, &active_config_desc);
         if (err == ESP_OK) {
             spdlog::info("尝试释放{}的所有接口", static_cast<void *>(event_msg->dev_gone.dev_hdl));
-            for (int intf_i = 0; intf_i < active_config_desc->bNumInterfaces; intf_i++) {
-                int intf_offset;
-                auto intf_desc = usb_parse_interface_descriptor(active_config_desc, intf_i, 0, &intf_offset);
-                if (!intf_desc)
-                    continue;
+            for (auto interface_number: collect_interface_numbers(active_config_desc)) {
                 // release 的第三参数是 bInterfaceNumber（接口号），
                 // 跳号接口用数组下标会释放错误的接口
                 err = usb_host_interface_release(this_server->host_client_handle, event_msg->dev_gone.dev_hdl,
-                                                 intf_desc->bInterfaceNumber);
+                                                 interface_number);
                 if (err != ESP_OK) {
-                    SPDLOG_ERROR("释放设备接口{}时出错: {}", intf_desc->bInterfaceNumber, esp_err_to_name(err));
+                    SPDLOG_ERROR("释放设备接口{}时出错: {}", interface_number, esp_err_to_name(err));
                 }
             }
 
@@ -164,54 +192,81 @@ esp_err_t usbipdcpp::Esp32Server::bind_host_device(usb_device_handle_t dev) {
 
     SPDLOG_DEBUG("该设备有{}个interface", active_config_desc->bNumInterfaces);
     std::vector<UsbInterface> interfaces;
-    for (auto intf_i = 0; intf_i < active_config_desc->bNumInterfaces; intf_i++) {
-        [[maybe_unused]] auto alter_setting_num = usb_parse_interface_number_of_alternate(active_config_desc, intf_i);
-        SPDLOG_DEBUG("第{}个interface有{}个altsetting", intf_i, alter_setting_num);
+    // 已成功 claim 的接口号，供失败时回滚（接口号与数组下标不一定一致）
+    SmallVector<std::uint8_t, 16> claimed_interfaces;
+    for (auto interface_number: collect_interface_numbers(active_config_desc)) {
+        [[maybe_unused]] auto alter_setting_num =
+                usb_parse_interface_number_of_alternate(active_config_desc, interface_number);
+        SPDLOG_DEBUG("接口{}有{}个altsetting", interface_number, alter_setting_num);
 
         int intf_offset;
-        auto intf_desc = usb_parse_interface_descriptor(active_config_desc, intf_i, 0, &intf_offset);
+        auto intf_desc = usb_parse_interface_descriptor(active_config_desc, interface_number, 0, &intf_offset);
         if (!intf_desc)
             continue;
-        //只使用第一个alsetting
         // claim 的第三参数是 bInterfaceNumber（接口号）而非数组下标：
         // usbh 内部按 intf_desc->bInterfaceNumber 匹配接口对象（usbh.c 的
         // interface_claim），跳号接口（如只有 0 和 2）用下标会指向不存在的接口
-        err = usb_host_interface_claim(host_client_handle, dev, intf_desc->bInterfaceNumber, 0);
+        err = usb_host_interface_claim(host_client_handle, dev, interface_number, 0);
         if (err != ESP_OK) {
-            SPDLOG_ERROR("无法声明接口{}：{}", intf_desc->bInterfaceNumber, esp_err_to_name(err));
+            SPDLOG_ERROR("无法声明接口{}：{}", interface_number, esp_err_to_name(err));
             // 回滚之前已成功声明的接口，否则它们会被永久占用
-            for (auto claimed_i = 0; claimed_i < intf_i; claimed_i++) {
-                int claimed_offset;
-                auto claimed_intf = usb_parse_interface_descriptor(active_config_desc, claimed_i, 0, &claimed_offset);
-                if (!claimed_intf)
-                    continue;
-                auto rel_ret = usb_host_interface_release(host_client_handle, dev, claimed_intf->bInterfaceNumber);
+            for (auto claimed_interface: claimed_interfaces) {
+                auto rel_ret = usb_host_interface_release(host_client_handle, dev, claimed_interface);
                 if (rel_ret != ESP_OK) {
-                    SPDLOG_ERROR("回滚释放接口{}失败: {}", claimed_intf->bInterfaceNumber, esp_err_to_name(rel_ret));
+                    SPDLOG_ERROR("回滚释放接口{}失败: {}", claimed_interface, esp_err_to_name(rel_ret));
                 }
             }
             usb_host_device_close(host_client_handle, dev);
             return err;
         }
+        claimed_interfaces.push_back(interface_number);
 
-        std::vector<UsbEndpoint> endpoints;
-        endpoints.reserve(intf_desc->bNumEndpoints);
-        for (auto ep_i = 0; ep_i < intf_desc->bNumEndpoints; ep_i++) {
-            int endpoint_offset = intf_offset;
-            auto ep_desc = usb_parse_endpoint_descriptor_by_index(intf_desc, ep_i, active_config_desc->wTotalLength,
-                                                                  &endpoint_offset);
-            endpoints.emplace_back(
-                    ep_desc->bEndpointAddress,
-                    ep_desc->bmAttributes,
-                    // 只取低 11 位：wMaxPacketSize 高 2 位是高速端点的附加
-                    // 事务数 / 超速 mult 编码，不是包长。hcd_dwc.c 用
-                    // USB_EP_DESC_GET_MPS（usb_types_ch9.h，掩码 0x07FF）取
-                    // MPS 并据此切分 QTD、校验 IN 长度对齐，这里必须与它一致，
-                    // 否则对齐/上限计算全部偏移
-                    USB_EP_DESC_GET_MPS(ep_desc),
-                    ep_desc->bInterval
-                    );
+        // 每个 altsetting 的端点都要缓存：SET_INTERFACE 切换后 find_ep 按
+        // UsbInterface::current_endpoints()（下标 = bAlternateSetting）查端点。
+        // 只登记 alt 0 的话，UVC 这类切到 alt 1 才有等时端点的设备拿不到端点。
+        // 索引按 bAlternateSetting 放置，alt 编号不连续时也不会错位
+        std::vector<std::vector<UsbEndpoint>> endpoints;
+        int alt_offset = 0;
+        const usb_standard_desc_t *cur = reinterpret_cast<const usb_standard_desc_t *>(active_config_desc);
+        const usb_intf_desc_t *alt_desc = reinterpret_cast<const usb_intf_desc_t *>(
+                usb_parse_next_descriptor_of_type(cur, active_config_desc->wTotalLength,
+                                                  USB_B_DESCRIPTOR_TYPE_INTERFACE, &alt_offset));
+        while (alt_desc) {
+            if (alt_desc->bInterfaceNumber == interface_number) {
+                if (endpoints.size() <= alt_desc->bAlternateSetting) {
+                    endpoints.resize(static_cast<std::size_t>(alt_desc->bAlternateSetting) + 1);
+                }
+                auto &alt_endpoints = endpoints[alt_desc->bAlternateSetting];
+                alt_endpoints.reserve(alt_desc->bNumEndpoints);
+                for (auto ep_i = 0; ep_i < alt_desc->bNumEndpoints; ep_i++) {
+                    int endpoint_offset = alt_offset;
+                    auto ep_desc = usb_parse_endpoint_descriptor_by_index(
+                            alt_desc, ep_i, active_config_desc->wTotalLength, &endpoint_offset);
+                    if (!ep_desc)
+                        continue;
+                    alt_endpoints.emplace_back(
+                            ep_desc->bEndpointAddress,
+                            ep_desc->bmAttributes,
+                            // 只取低 11 位：wMaxPacketSize 高 2 位是高速端点的附加
+                            // 事务数 / 超速 mult 编码，不是包长。hcd_dwc.c 用
+                            // USB_EP_DESC_GET_MPS（usb_types_ch9.h，掩码 0x07FF）取
+                            // MPS 并据此切分 QTD、校验 IN 长度对齐，这里必须与它一致，
+                            // 否则对齐/上限计算全部偏移
+                            USB_EP_DESC_GET_MPS(ep_desc),
+                            ep_desc->bInterval
+                            );
+                }
+            }
+            cur = reinterpret_cast<const usb_standard_desc_t *>(alt_desc);
+            alt_desc = reinterpret_cast<const usb_intf_desc_t *>(
+                    usb_parse_next_descriptor_of_type(cur, active_config_desc->wTotalLength,
+                                                      USB_B_DESCRIPTOR_TYPE_INTERFACE, &alt_offset));
         }
+        // 没有任何接口描述符时也留一个空 alt 0，current_endpoints() 才不会越界
+        if (endpoints.empty()) {
+            endpoints.emplace_back();
+        }
+
         interfaces.emplace_back(
                 UsbInterface{
                         .interface_class = intf_desc->bInterfaceClass,
@@ -220,8 +275,7 @@ esp_err_t usbipdcpp::Esp32Server::bind_host_device(usb_device_handle_t dev) {
                         // 跳号接口（如只有接口 0 和 2）时下标≠接口号，必须按
                         // 描述符的 bInterfaceNumber 填充，SET_INTERFACE 才匹配正确
                         .interface_number = intf_desc->bInterfaceNumber,
-                        // endpoints 按 altsetting 分组，这里只使用第一个 altsetting（alt 0）
-                        .endpoints = {std::move(endpoints)}
+                        .endpoints = std::move(endpoints)
                 }
                 //直接全用libusb控制，不用走端口
                 // .with_handler<LibusbInterfaceHandler>()
@@ -290,16 +344,12 @@ void usbipdcpp::Esp32Server::unbind_host_device(usb_device_handle_t dev) {
                     SPDLOG_ERROR("无法获取设备活动配置描述符：{}", esp_err_to_name(err));
                     return;
                 }
-                for (int intf_i = 0; intf_i < active_config_desc->bNumInterfaces; intf_i++) {
-                    int intf_offset;
-                    auto intf_desc = usb_parse_interface_descriptor(active_config_desc, intf_i, 0, &intf_offset);
-                    if (!intf_desc)
-                        continue;
+                for (auto interface_number: collect_interface_numbers(active_config_desc)) {
                     // release 的第三参数是 bInterfaceNumber（接口号），
                     // 跳号接口用数组下标会释放错误的接口
-                    err = usb_host_interface_release(host_client_handle, dev, intf_desc->bInterfaceNumber);
+                    err = usb_host_interface_release(host_client_handle, dev, interface_number);
                     if (err != ESP_OK) {
-                        SPDLOG_ERROR("释放接口{}时出错: {}", intf_desc->bInterfaceNumber, esp_err_to_name(err));
+                        SPDLOG_ERROR("释放接口{}时出错: {}", interface_number, esp_err_to_name(err));
                     }
                 }
                 server_available_devices.erase(i);
@@ -450,16 +500,12 @@ void usbipdcpp::Esp32Server::stop() {
                     SPDLOG_ERROR("无法获取活动配置描述符：{}", esp_err_to_name(err));
                     continue;
                 }
-                for (int intf_i = 0; intf_i < active_config_desc->bNumInterfaces; intf_i++) {
-                    int intf_offset;
-                    auto intf_desc = usb_parse_interface_descriptor(active_config_desc, intf_i, 0, &intf_offset);
-                    if (!intf_desc)
-                        continue;
+                for (auto interface_number: collect_interface_numbers(active_config_desc)) {
                     // release 的第三参数是 bInterfaceNumber（接口号），
                     // 跳号接口用数组下标会释放错误的接口
-                    err = usb_host_interface_release(host_client_handle, device, intf_desc->bInterfaceNumber);
+                    err = usb_host_interface_release(host_client_handle, device, interface_number);
                     if (err) {
-                        SPDLOG_ERROR("释放设备接口{}时出错: {}", intf_desc->bInterfaceNumber, esp_err_to_name(err));
+                        SPDLOG_ERROR("释放设备接口{}时出错: {}", interface_number, esp_err_to_name(err));
                     }
                 }
             }
@@ -474,16 +520,12 @@ void usbipdcpp::Esp32Server::stop() {
                     SPDLOG_ERROR("无法获取活动配置描述符：{}", esp_err_to_name(err));
                     continue;
                 }
-                for (int intf_i = 0; intf_i < active_config_desc->bNumInterfaces; intf_i++) {
-                    int intf_offset;
-                    auto intf_desc = usb_parse_interface_descriptor(active_config_desc, intf_i, 0, &intf_offset);
-                    if (!intf_desc)
-                        continue;
+                for (auto interface_number: collect_interface_numbers(active_config_desc)) {
                     // release 的第三参数是 bInterfaceNumber（接口号），
                     // 跳号接口用数组下标会释放错误的接口
-                    err = usb_host_interface_release(host_client_handle, device, intf_desc->bInterfaceNumber);
+                    err = usb_host_interface_release(host_client_handle, device, interface_number);
                     if (err) {
-                        SPDLOG_ERROR("释放设备接口{}时出错: {}", intf_desc->bInterfaceNumber, esp_err_to_name(err));
+                        SPDLOG_ERROR("释放设备接口{}时出错: {}", interface_number, esp_err_to_name(err));
                     }
                 }
             }

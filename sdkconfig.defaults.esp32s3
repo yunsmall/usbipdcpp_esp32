@@ -28,3 +28,9 @@ CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS=4
 CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=4096
 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
 CONFIG_USB_HOST_HUBS_SUPPORTED=y
+# 枚举时读取配置描述符的控制传输缓冲区大小。IDF 默认 256，配置描述符超过
+# 256 字节的设备（多接口复合设备等）会直接枚举失败：enum.c 的
+# parse_short_config_desc 拿 wTotalLength 和这个值比较，超了报
+# "Configuration descriptor larger than control transfer max length"，
+# 随后 EXT_PORT 禁用端口，设备根本不会出现在 USB/IP 设备列表里
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024

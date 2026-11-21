@@ -42,6 +42,40 @@ void usbipdcpp::Esp32DeviceHandler::on_new_connection(TransferResponder &respond
     device_removed_ = false;
     log_heap_diag(TAG);
 
+    // 上一个会话可能停在非 0 的 altsetting（客户端 detach 不会自动切回），
+    // 新会话的客户端按 alt 0 枚举/传输会错位。libusb 后端打开设备时同样会把
+    // 所有接口设回 alt 0（LibusbDeviceHandler 的 open 路径）：主机侧
+    // release/claim 回 alt 0，再发 SET_INTERFACE 让设备也回到 alt 0
+    for (auto &intf: handle_device.interfaces) {
+        if (intf.current_altsetting == 0) {
+            continue;
+        }
+        auto err = usb_host_interface_release(host_client_handle, native_handle, intf.interface_number);
+        if (err == ESP_OK) {
+            err = usb_host_interface_claim(host_client_handle, native_handle, intf.interface_number, 0);
+        }
+        if (err != ESP_OK) {
+            SPDLOG_WARN("新会话恢复接口 {} 到 alt 0 失败：{}", intf.interface_number, esp_err_to_name(err));
+            continue;
+        }
+        const SetupPacket set_interface{
+                .request_type = 0x01, // Standard | Interface | OUT
+                .request = static_cast<std::uint8_t>(StandardRequest::SetInterface),
+                .value = 0,
+                .index = intf.interface_number,
+                .length = 0,
+        };
+        err = sync_control_transfer(set_interface);
+        if (err != ESP_OK) {
+            SPDLOG_WARN("新会话设置接口 {} alt 0 的设备请求失败：{}", intf.interface_number,
+                        esp_err_to_name(err));
+        }
+        // 与 libusb 后端一致：设备请求失败也记 alt 0（主机侧端点表已经是
+        // alt 0，保持旧值会让 find_ep 和实际端点不一致；客户端后续发
+        // SET_INTERFACE 会重新纠正设备端）
+        intf.current_altsetting = 0;
+    }
+
     // 构建端点 MPS 查找表
     transfer_operator_->endpoint_mps_map_.clear();
     for (const auto &intf: handle_device.interfaces) {
@@ -563,23 +597,29 @@ esp_err_t usbipdcpp::Esp32DeviceHandler::sync_control_transfer(const SetupPacket
             std::memset(transfer->data_buffer + USB_SETUP_PACKET_SIZE, 0, setup_packet.length);
         }
 
-        std::binary_semaphore semaphore{0};
+        // 传输结果带回给同步等待方：status 非 COMPLETED 时必须返回错误，
+        // 否则 SET_INTERFACE 这类调用会把"设备没执行"当成成功
+        struct sync_result {
+            std::binary_semaphore semaphore{0};
+            usb_transfer_status_t status = USB_TRANSFER_STATUS_COMPLETED;
+        } result;
 
         transfer->device_handle = native_handle;
         transfer->callback = [](usb_transfer_t *transfer) {
+            auto *result = static_cast<sync_result *>(transfer->context);
             if (transfer->status != USB_TRANSFER_STATUS_COMPLETED) {
                 SPDLOG_ERROR("sync_control_transfer transfer status is not complete, which is {}",
                              static_cast<std::int32_t>(transfer->status));
+                result->status = transfer->status;
             }
-            std::binary_semaphore &semaphore = *static_cast<std::binary_semaphore *>(transfer->context);
-            semaphore.release();
             // 传输已完成，在回调里归还给 usb_host，否则每次 CLEAR_FEATURE
             // 都泄漏一个 usb_transfer_t（函数 acquire 返回后不会释放它）。
             // 回调执行时 usb_host 已把 urb 从队列摘除（usb_host.c 的
             // _handle_pending_ep / done_ctrl_xfer 处理），此处置 free 安全
             usb_host_transfer_free(transfer);
+            result->semaphore.release();
         };
-        transfer->context = &semaphore;
+        transfer->context = &result;
         transfer->bEndpointAddress = setup_packet.calc_ep0_address();
         transfer->num_bytes = USB_SETUP_PACKET_SIZE + setup_packet.length;
 
@@ -593,8 +633,8 @@ esp_err_t usbipdcpp::Esp32DeviceHandler::sync_control_transfer(const SetupPacket
         // 超时返回会留下仍在飞行的传输，其回调晚于函数返回执行时会写
         // 栈上已销毁的 semaphore（UAF）。设备拔出时 usbh 会自动取消 ep0
         // 传输并触发回调，因此这里不会永久阻塞
-        semaphore.acquire();
-        return ESP_OK;
+        result.semaphore.acquire();
+        return result.status == USB_TRANSFER_STATUS_COMPLETED ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
     }
 
 error_occurred:
@@ -621,38 +661,86 @@ int usbipdcpp::Esp32DeviceHandler::tweak_clear_halt_cmd(const SetupPacket &setup
 }
 
 int usbipdcpp::Esp32DeviceHandler::tweak_set_interface_cmd(const SetupPacket &setup_packet) {
-    [[maybe_unused]] uint16_t interface = setup_packet.index;
-    [[maybe_unused]] uint16_t alternate = setup_packet.value;
+    // wIndex/wValue 只有低 8 位有效（接口号 / altsetting 编号），超范围直接
+    // 拒绝：截断后可能误匹配到别的接口或把非法 alt 当成 0 静默成功
+    if (setup_packet.index > 0xFF || setup_packet.value > 0xFF || setup_packet.length != 0) [[unlikely]] {
+        SPDLOG_ERROR("SET_INTERFACE 参数非法：wIndex={}, wValue={}, wLength={}",
+                     setup_packet.index, setup_packet.value, setup_packet.length);
+        return ESP_ERR_INVALID_ARG;
+    }
+    const auto interface = static_cast<std::uint8_t>(setup_packet.index);
+    const auto alternate = static_cast<std::uint8_t>(setup_packet.value);
 
     SPDLOG_DEBUG("set_interface: inf {} alt {}", interface, alternate);
 
-    // ESP-IDF v5.5 没有提供切换 altsetting 的 API：usb_host.h 只有
-    // interface_claim/release，claim 的 bAlternateSetting 只在登记时选择
-    // 端点，不会向设备发 SET_INTERFACE（usb_host.c 的 interface_claim 只按
-    // alt 解析描述符并分配端点）。真正切换需要自己提交 SET_INTERFACE 控制
-    // 请求，再 release/claim 新 alt 重建端点。本后端目前没做这件事：
-    // bind_host_device 只解析并 claim 了 alt 0，UsbDevice 里也只填了 alt 0
-    // 的端点组（UsbInterface::endpoints 本身支持按 altsetting 分组，libusb
-    // 后端就填了全部 alt）。处理取决于请求的 alternate：
-    //
-    //   * alt 0 — the interface is already at alt 0 after SET_CONFIGURATION,
-    //     so a client asking for alt 0 is effectively a no-op. Report
-    //     success so standard Linux-kernel enumeration (which issues
-    //     SET_INTERFACE(alt=0) for interfaces with multiple alt-settings)
-    //     proceeds cleanly.
-    //
-    //   * alt != 0 — we cannot honor the request. Previously this returned
-    //     ESP_OK and the client believed the switch succeeded, which is
-    //     silent data corruption for devices that have meaningful
-    //     alt-settings (UVC cameras, class-compound audio devices, etc.).
-    //     Return an error instead so the client sees the failure.
-    if (alternate == 0) {
-        SPDLOG_DEBUG("set_interface alt=0 treated as no-op (already at default alt)");
+    UsbInterface *target = nullptr;
+    for (auto &intf: handle_device.interfaces) {
+        if (intf.interface_number == interface) {
+            target = &intf;
+            break;
+        }
+    }
+    if (!target) {
+        SPDLOG_ERROR("SET_INTERFACE 找不到接口 {}", interface);
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (alternate >= target->endpoints.size()) {
+        SPDLOG_ERROR("SET_INTERFACE 接口 {} 的 alt {} 超出 bind 时缓存的端点表", interface, alternate);
+        return ESP_ERR_NOT_FOUND;
+    }
+    const auto old_alternate = target->current_altsetting;
+    if (old_alternate == alternate) {
+        SPDLOG_DEBUG("set_interface 接口 {} 已处于 alt {}，无需切换", interface, alternate);
         return ESP_OK;
     }
-    SPDLOG_ERROR("set_interface alt={} not supported by ESP-IDF usb_host_lib", alternate);
-    ESP_LOGE(TAG, "set_interface alt=%u not supported by ESP-IDF usb_host_lib", alternate);
-    return ESP_ERR_NOT_SUPPORTED;
+
+    // ESP-IDF 的端点属于 claim 时指定的 altsetting：usb_host.c 的
+    // interface_claim 按 bAlternateSetting 解析描述符并分配端点，没有运行时
+    // set_altsetting 接口，切换只能 release 再 claim。release 要求该接口的
+    // 端点没有在途 URB（interface_release 检查 num_urb_inflight），客户端按
+    // 规范应先停掉接口流量再发 SET_INTERFACE
+    esp_err_t err = usb_host_interface_release(host_client_handle, native_handle, interface);
+    if (err != ESP_OK) {
+        SPDLOG_ERROR("SET_INTERFACE 释放接口 {} 失败：{}", interface, esp_err_to_name(err));
+        return err;
+    }
+    err = usb_host_interface_claim(host_client_handle, native_handle, interface, alternate);
+    if (err != ESP_OK) {
+        SPDLOG_ERROR("SET_INTERFACE 接口 {} 声明 alt {} 失败：{}", interface, alternate, esp_err_to_name(err));
+        auto rollback = usb_host_interface_claim(host_client_handle, native_handle, interface, old_alternate);
+        if (rollback != ESP_OK) {
+            SPDLOG_ERROR("SET_INTERFACE 回滚接口 {} 到 alt {} 失败：{}", interface, old_alternate,
+                         esp_err_to_name(rollback));
+        }
+        return err;
+    }
+
+    // claim 只在主机侧登记端点，不会给设备发 SET_INTERFACE（interface_claim
+    // 内部没有控制传输），设备端的 altsetting 必须自己转发
+    err = sync_control_transfer(setup_packet);
+    if (err != ESP_OK) {
+        SPDLOG_ERROR("SET_INTERFACE 接口 {} alt {} 设备请求失败：{}", interface, alternate, esp_err_to_name(err));
+        // 设备仍停在旧 alt，主机侧端点表也要退回去
+        usb_host_interface_release(host_client_handle, native_handle, interface);
+        auto rollback = usb_host_interface_claim(host_client_handle, native_handle, interface, old_alternate);
+        if (rollback != ESP_OK) {
+            SPDLOG_ERROR("SET_INTERFACE 回滚接口 {} 到 alt {} 失败：{}", interface, old_alternate,
+                         esp_err_to_name(rollback));
+        }
+        return err;
+    }
+
+    // 更新端点 MPS 表：UVC 的 alt 0 可能没有端点、alt 1 才有等时端点，
+    // 旧 alt 的地址要先清掉再登记新 alt 的
+    for (const auto &ep: target->current_endpoints()) {
+        transfer_operator_->endpoint_mps_map_.erase(ep.address);
+    }
+    target->current_altsetting = alternate;
+    for (const auto &ep: target->current_endpoints()) {
+        transfer_operator_->endpoint_mps_map_[ep.address] = ep.max_packet_size;
+    }
+    SPDLOG_DEBUG("接口 {} 已切换到 alt {}，端点数量: {}", interface, alternate, target->current_endpoints().size());
+    return ESP_OK;
 }
 
 int usbipdcpp::Esp32DeviceHandler::tweak_set_configuration_cmd(const SetupPacket &setup_packet) {
